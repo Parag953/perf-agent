@@ -15,12 +15,16 @@ Flow:
   6. claude --resume → completes analysis, posts to Slack
 """
 
+import base64
 import json
 import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
+import urllib.parse
+import urllib.request
 from typing import Optional, Tuple
 
 from flask import Flask, request, jsonify
@@ -30,13 +34,16 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SLACK_CHANNEL  = "C0C1SH00CP9"
-MCP_CONFIG     = "/opt/agent/mcp.json"
-VOYAGER_PATH   = "/opt/agent/voyager"
-VOYAGER_REPO   = "andromedasec/voyager"
-S3_BUCKET      = "as-live-heap-dump"
-WEBHOOK_PORT   = 8080
-CLAUDE_TIMEOUT = 900          # seconds per claude invocation (it fetches + explores now)
+SLACK_CHANNEL   = "C0C1SH00CP9"
+MCP_CONFIG_BASE = "/opt/agent/mcp.json"   # static base (datadog); gateway merged in at runtime
+VOYAGER_PATH    = "/opt/agent/voyager"
+VOYAGER_REPO    = "andromedasec/voyager"
+S3_BUCKET       = "as-live-heap-dump"
+WEBHOOK_PORT    = 8080
+CLAUDE_TIMEOUT  = 900          # seconds per claude invocation (it fetches + explores now)
+
+# Tools Claude may use without prompting (headless). Includes both MCP servers.
+ALLOWED_TOOLS = "Bash,Edit,Write,mcp__datadog__*,mcp__andromeda_gateway__*"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,15 +81,78 @@ def setup_voyager_repo() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Andromeda gateway (OAuth client-credentials) + runtime MCP config
+# ---------------------------------------------------------------------------
+def mint_gateway_token() -> Optional[str]:
+    """
+    Exchange the gateway client_id/secret for a short-lived access token via the
+    OAuth client_credentials grant. Returns None if not configured or on failure.
+    """
+    cid    = os.environ.get("ANDROMEDA_GW_CLIENT_ID")
+    secret = os.environ.get("ANDROMEDA_GW_CLIENT_SECRET")
+    url    = os.environ.get("ANDROMEDA_GW_TOKEN_URL")
+    if not (cid and secret and url):
+        return None
+
+    data  = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+    basic = base64.b64encode(f"{cid}:{secret}".encode()).decode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            tok = json.load(resp).get("access_token")
+        log.info("gateway token minted (len=%s)", len(tok) if tok else 0)
+        return tok
+    except Exception as e:
+        log.warning("gateway token mint failed: %s", e)
+        return None
+
+
+def build_runtime_mcp_config() -> str:
+    """
+    Write a per-run MCP config: the static base (datadog) plus the Andromeda
+    gateway with a freshly-minted Bearer token. Returns the temp file path
+    (caller must delete it). Falls back to base-only if the gateway is unavailable.
+    """
+    try:
+        with open(MCP_CONFIG_BASE) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {"mcpServers": {}}
+    cfg.setdefault("mcpServers", {})
+
+    token = mint_gateway_token()
+    gw_url = os.environ.get("ANDROMEDA_GW_MCP_URL")
+    if token and gw_url:
+        cfg["mcpServers"]["andromeda_gateway"] = {
+            "type": "http",
+            "url": gw_url,
+            "headers": {"Authorization": f"Bearer {token}"},
+        }
+
+    fd, path = tempfile.mkstemp(prefix="mcp-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(path, 0o600)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Claude helpers
 # ---------------------------------------------------------------------------
 def run_claude(prompt: str, session_id: Optional[str] = None) -> Tuple[Optional[str], str]:
     """Invoke `claude -p` and return (session_id, result_text)."""
+    mcp_path = build_runtime_mcp_config()
     cmd = [
         "claude", "-p", prompt,
-        "--mcp-config", MCP_CONFIG,
+        "--mcp-config", mcp_path,
         "--output-format", "json",
-        "--allowedTools", "Bash,Edit,Write,mcp__datadog__*",
+        "--allowedTools", ALLOWED_TOOLS,
     ]
     if session_id:
         cmd += ["--resume", session_id]
@@ -98,6 +168,11 @@ def run_claude(prompt: str, session_id: Optional[str] = None) -> Tuple[Optional[
     except subprocess.TimeoutExpired:
         log.error("claude timed out after %ss", CLAUDE_TIMEOUT)
         return None, "Analysis timed out — please try again."
+    finally:
+        try:
+            os.remove(mcp_path)
+        except OSError:
+            pass
 
     if result.returncode != 0:
         log.error("claude exit %s: %s", result.returncode, result.stderr[:500])
@@ -187,6 +262,8 @@ You have access to the following. Use each ONLY if your investigation calls for 
    Pick the most recent capture unless the alert points elsewhere.
 
 3. DATADOG — via MCP tools (metrics, logs, traces). Use for runtime evidence.
+   ANDROMEDA PLATFORM — via MCP tools (mcp__andromeda_gateway__*). Use these for
+   tenant/provider/platform data when the investigation needs it.
 
 4. DATABASES — you CANNOT query PostgreSQL or Neo4j directly. When you need data from them,
    output this EXACT block and then STOP (a human runs the queries and replies with results):
