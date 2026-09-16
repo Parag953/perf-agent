@@ -1,0 +1,31 @@
+[Unit]
+Description=Andromeda Agent — pprof analysis via Claude + Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agent
+Group=agent
+WorkingDirectory=/opt/agent
+
+# Secrets + config — root-owned 0600, never committed anywhere
+EnvironmentFile=/opt/agent/.env
+
+# Claude headless auth + runtime — PATH must include /usr/bin so `claude` is found
+# by both this process and any subprocesses it spawns
+Environment=PATH=/usr/bin:/usr/local/bin
+Environment=AWS_DEFAULT_REGION=us-west-2
+
+ExecStart=/opt/agent/venv/bin/python3 /opt/agent/app.py
+
+# Restart on any non-zero exit; give it 5s before retrying
+Restart=always
+RestartSec=5
+
+# Capture stdout/stderr into journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent
+
+[Install]
+WantedBy=multi-user.target
