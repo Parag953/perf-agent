@@ -471,17 +471,28 @@ slack = SlackApp(token=os.environ["SLACK_BOT_TOKEN"])
 @slack.event("message")
 def handle_message(event, say):  # noqa: ARG001
     """Listen for thread replies with query results."""
+    log.info(
+        "Slack message event: channel=%s thread_ts=%s subtype=%s from_bot=%s text=%r",
+        event.get("channel"), event.get("thread_ts"),
+        event.get("subtype"), bool(event.get("bot_id")),
+        (event.get("text") or "")[:80],
+    )
     if event.get("channel") != SLACK_CHANNEL:
+        log.info("  ignored: different channel")
         return
     if event.get("bot_id") or event.get("bot_profile"):
+        log.info("  ignored: from a bot")
         return
     thread_ts = event.get("thread_ts")
     if not thread_ts:
+        log.info("  ignored: top-level message (not a thread reply)")
         return
 
     with _lock:
         is_pending = thread_ts in pending_sessions
+        pend = list(pending_sessions.keys())
     if not is_pending:
+        log.info("  ignored: thread %s not in pending %s", thread_ts, pend)
         return
 
     human_data = event.get("text", "").strip()
