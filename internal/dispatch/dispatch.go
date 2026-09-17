@@ -387,9 +387,13 @@ Alert payload:
 %s
 You have access to the following. Use each ONLY if your investigation calls for it:
 
-1. SOURCE CODE — the full Voyager monorepo is checked out locally at %s
-   (this service: %s/services/%s). Use your Bash tool to grep and read files
-   (rg, cat, ls, git log, etc.).
+1. SOURCE CODE — the full Voyager monorepo is checked out on this VM at %s.
+   The alert names a Kubernetes DEPLOYMENT, which may not match the source directory
+   (a "…-realtime-logs" deployment, for instance, is built from services/ingester).
+   Resolve the directory before assuming a path:
+       ls %s/services
+       find %s/services -maxdepth 3 -iname '*<distinctive-part-of-the-name>*'
+   Use your Bash tool to grep and read files (rg, cat, ls, git log, etc.).
 
 2. pprof PROFILES — production heap/goroutine captures live in S3, one folder per capture:
        s3://%s/%s/<TIMESTAMP>/heap.dump       (Go heap profile, protobuf)
@@ -421,7 +425,7 @@ On the LAST line of your reply, output the PR link as:
 PR_URL: <the URL gh printed>
 If you are not confident enough to write a fix, do not open a PR — just report the analysis.`,
 		t.Alert, t.Service, payload, prior,
-		cfg.VoyagerPath, cfg.VoyagerPath, t.Service,
+		cfg.VoyagerPath, cfg.VoyagerPath, cfg.VoyagerPath,
 		cfg.S3Bucket, t.Service, cfg.S3Bucket, t.Service, cfg.S3Bucket, t.Service,
 		cfg.S3Bucket, t.Service, cfg.S3Bucket, t.Service,
 		cfg.VoyagerPath, t.Service, cfg.VoyagerRepo,

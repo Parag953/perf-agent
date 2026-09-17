@@ -94,7 +94,7 @@ func Load() Config {
 		AWSSessionToken:    env("AWS_SESSION_TOKEN", ""),
 		AWSRegion:          env("AWS_REGION", env("AWS_DEFAULT_REGION", "us-west-2")),
 
-		VoyagerPath:   env("VOYAGER_PATH", "/opt/agent/voyager"),
+		VoyagerPath:   env("VOYAGER_PATH", "$HOME/voyager"),
 		VoyagerRepo:   env("VOYAGER_REPO", "andromedasec/voyager"),
 		S3Bucket:      env("S3_BUCKET", "as-live-heap-dump"),
 		MCPConfig:     env("MCP_CONFIG", "/opt/agent/mcp.json"),
