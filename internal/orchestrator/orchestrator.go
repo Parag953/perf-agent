@@ -17,6 +17,7 @@ import (
 	"github.com/Parag953/perf-agent/internal/llm"
 	"github.com/Parag953/perf-agent/internal/model"
 	"github.com/Parag953/perf-agent/internal/poold"
+	"github.com/Parag953/perf-agent/internal/slack"
 	"github.com/Parag953/perf-agent/internal/store"
 )
 
@@ -36,9 +37,10 @@ type Orchestrator struct {
 	pool poold.Client
 	mem  *store.Store
 	llm  llm.Client
-	disp dispatch.Dispatcher
-	hub  Broadcaster
-	log  *log.Logger
+	disp   dispatch.Dispatcher
+	hub    Broadcaster
+	notify *slack.Notifier // optional; nil disables Slack posts (nil-safe methods)
+	log    *log.Logger
 
 	mu       sync.Mutex
 	tasks    map[string]*model.Task
@@ -62,19 +64,20 @@ type Orchestrator struct {
 	subs  map[string]map[chan model.AgentEvent]struct{}
 }
 
-func New(cfg config.Config, pool poold.Client, mem *store.Store, l llm.Client, disp dispatch.Dispatcher, hub Broadcaster, logger *log.Logger) *Orchestrator {
+func New(cfg config.Config, pool poold.Client, mem *store.Store, l llm.Client, disp dispatch.Dispatcher, hub Broadcaster, notify *slack.Notifier, logger *log.Logger) *Orchestrator {
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 4
 	}
 	return &Orchestrator{
-		cfg:   cfg,
-		pool:  pool,
-		mem:   mem,
-		llm:   l,
-		disp:  disp,
-		hub:   hub,
-		log:   logger,
+		cfg:    cfg,
+		pool:   pool,
+		mem:    mem,
+		llm:    l,
+		disp:   disp,
+		hub:    hub,
+		notify: notify,
+		log:    logger,
 		tasks: make(map[string]*model.Task),
 		wake:  make(chan struct{}, 1),
 		gate:  make(chan struct{}, workers),
@@ -359,6 +362,20 @@ func (o *Orchestrator) run(ctx context.Context, task *model.Task, lease *poold.L
 		t.Summary = mem.FixSummary
 	})
 	o.log.Printf("task %s: done (outcome=%s, pr=%q, mem=%d)", task.ID, outcome, prURL, memID)
+
+	// Post the result to Slack (best-effort, off the release path). Only new
+	// investigations reach here; nil notifier is a no-op.
+	go o.notify.PostResult(context.Background(), slack.Result{
+		TaskID:     task.ID,
+		Service:    task.Service,
+		Alert:      task.Alert,
+		Outcome:    string(outcome),
+		Symptom:    mem.Symptom,
+		RootCause:  mem.RootCause,
+		FixSummary: mem.FixSummary,
+		PRURL:      prURL,
+		Elapsed:    time.Since(now),
+	})
 }
 
 func (o *Orchestrator) release(vmID string) {

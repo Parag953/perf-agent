@@ -18,6 +18,7 @@ import (
 	"github.com/Parag953/perf-agent/internal/llm"
 	"github.com/Parag953/perf-agent/internal/orchestrator"
 	"github.com/Parag953/perf-agent/internal/poold"
+	"github.com/Parag953/perf-agent/internal/slack"
 	"github.com/Parag953/perf-agent/internal/store"
 )
 
@@ -45,8 +46,9 @@ func main() {
 	pool := poold.New(cfg.PooldURL)
 	disp := dispatch.New(cfg)
 	hub := api.NewHub()
+	notifier := slack.New(cfg.SlackBotToken, cfg.SlackChannel, logger)
 
-	orch := orchestrator.New(cfg, pool, mem, llmClient, disp, hub, logger)
+	orch := orchestrator.New(cfg, pool, mem, llmClient, disp, hub, notifier, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -57,8 +59,12 @@ func main() {
 		Handler: api.NewServer(orch, hub, logger).Handler(),
 	}
 
-	logger.Printf("config: poold=%s dispatch=%s llm=%s(%s) workers=%d db=%s",
-		cfg.PooldURL, disp.Mode(), llmClient.Backend(), cfg.HaikuModel, cfg.Workers, cfg.DBPath)
+	slackStatus := "off"
+	if notifier != nil {
+		slackStatus = "on(" + cfg.SlackChannel + ")"
+	}
+	logger.Printf("config: poold=%s dispatch=%s llm=%s(%s) workers=%d db=%s slack=%s",
+		cfg.PooldURL, disp.Mode(), llmClient.Backend(), cfg.HaikuModel, cfg.Workers, cfg.DBPath, slackStatus)
 	logger.Printf("listening on %s (dashboard at /, webhook at /webhook)", cfg.WebhookAddr)
 
 	go func() {

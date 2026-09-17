@@ -120,7 +120,19 @@ A finished task also carries an **`outcome`**: `pr_opened` (with `pr_url`),
 Everything is env-driven; see [`.env.example`](.env.example). Key knobs:
 `POOLD_URL`, `WORKERS`, `QUEUE_POLL_SECS`, `DB_PATH`, `DISPATCH_MODE` (`ssh`|`mock`),
 `LLM_BACKEND` (`api`|`cli`|`stub`), `ANTHROPIC_API_KEY`, `CLAUDE_TIMEOUT`,
-`MOCK_STEP_DELAY_MS` (paces the mock dispatcher for demos).
+`MOCK_STEP_DELAY_MS` (paces the mock dispatcher for demos),
+`SLACK_BOT_TOKEN` + `SLACK_CHANNEL` (see below).
+
+### Slack notifications (optional)
+
+Set `SLACK_BOT_TOKEN` (a `xoxb-…` bot token with the `chat:write` scope, with the
+app added to the channel) and `SLACK_CHANNEL` (a channel ID like `C0C1SH00CP9` or
+`#name`). When both are present, the orchestrator posts each finished *new*
+investigation to the channel via `chat.postMessage` — symptom, root cause, fix
+summary, and the PR link. It fires only for investigations that actually run a VM
+(memory cache hits are not posted); posting is best-effort and off the critical
+path, so a Slack failure is logged and never affects the task. Leave either var
+empty to disable.
 
 `WORKERS` now bounds only concurrent *memory lookups*; how many investigations run
 at once is bounded by the pool itself, since one scheduler owns every lease.

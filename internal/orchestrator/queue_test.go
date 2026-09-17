@@ -92,7 +92,7 @@ func newPacedOrch(t *testing.T, pool poold.Client, step time.Duration) (*Orchest
 		QueuePoll:     20 * time.Millisecond,
 		MockStepDelay: step,
 	}
-	o := New(cfg, pool, mem, fakeLLM{}, dispatch.New(cfg), nil, log.New(io.Discard, "", 0))
+	o := New(cfg, pool, mem, fakeLLM{}, dispatch.New(cfg), nil, nil, log.New(io.Discard, "", 0))
 	return o, mem
 }
 
