@@ -242,7 +242,8 @@ class Store:
         with self._tx():
             self.db.execute("UPDATE runs SET state='queued', box=NULL WHERE state='preparing'")
             self.db.execute("UPDATE runs SET state='abandoned', ended_at=?, error='poold restarted' WHERE state='running'", (now,))
-            self.db.execute("UPDATE boxes SET state='dirty', since=?, lease_id=NULL, run_id=NULL WHERE state IN ('preparing','leased')", (now,))
+            self.db.execute("UPDATE boxes SET state='dirty', since=?, lease_id=NULL, run_id=NULL "
+                            "WHERE state='preparing' OR (state='leased' AND heartbeat_required=1)", (now,))
 
 
 class _Tx:

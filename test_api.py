@@ -212,7 +212,7 @@ class OrchestratorContract(unittest.TestCase):
         code, body = http("POST", f"{self.base}/poold/release", {"vm_id": "VM102"})
         self.assertEqual(code, 200)
         self.assertEqual(body, {"ok": True})
-        self.assertIn(self.vm()["state"], ("free", "ready"))
+        self.assertIn(self.vm()["state"], ("degraded", "ready"))
         self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready" and len(self.pve.rollbacks) == 2, 10))
 
     def test_release_unknown_or_unleased_vm_is_404_or_409(self):
@@ -227,7 +227,20 @@ class OrchestratorContract(unittest.TestCase):
         self.assertEqual(v["state"], "allocated")
         self.assertEqual(v["poold_state"], "leased")
         http("POST", f"{self.base}/boxes/andro-b/quarantine")
-        self.assertEqual(self.vm()["state"], "degraded")
+        v = self.vm()
+        self.assertEqual((v["state"], v["degraded_reason"]), ("degraded", "quarantined"))
+
+    def test_preparing_and_dirty_read_degraded_with_a_reason(self):
+        self.p.pause_dispatch = True
+        v = self.vm()
+        self.assertEqual((v["state"], v["degraded_reason"]), ("degraded", "dirty"))
+        self.p.pause_dispatch = False
+        self.assertTrue(wait_for(lambda: self.vm()["poold_state"] in ("preparing", "ready"), 5))
+        v = self.vm()
+        if v["poold_state"] == "preparing":
+            self.assertEqual((v["state"], v["degraded_reason"]), ("degraded", "preparing"))
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready", 10))
+        self.assertIsNone(self.vm()["degraded_reason"])
 
 
 class ReadyBoxHandover(unittest.TestCase):
@@ -335,7 +348,7 @@ class ProxmoxLockAwareness(unittest.TestCase):
             self.assertTrue(wait_for(lambda: http("GET", f"{base}/poold/status")[1]["vms"][0]["state"] == "ready", 10))
             pve.lock = "snapshot"; p.vm_cache.clear()
             v = http("GET", f"{base}/poold/status")[1]["vms"][0]
-            self.assertEqual((v["state"], v["poold_state"], v["vm_lock"]), ("free", "ready", "snapshot"))
+            self.assertEqual((v["state"], v["poold_state"], v["vm_lock"], v["degraded_reason"]), ("degraded", "ready", "snapshot", "locked"))
             self.assertEqual(http("POST", f"{base}/poold/lease")[0], 409)
             pve.lock = None; p.vm_cache.clear()
             self.assertEqual(http("GET", f"{base}/poold/status")[1]["vms"][0]["state"], "ready")

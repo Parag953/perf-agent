@@ -15,8 +15,9 @@ API: `GET /status`, `GET /boxes/<name>`, `POST /run {task, owner, source, ttl_s,
 
 Orchestrator contract (kept alongside the native API): `POST /poold/lease` → `200 {vm_id, host, ssh_target,
 state:"allocated"}` or `409 {error:"no_capacity"}`; `POST /poold/release {vm_id}` → `{ok:true}`;
-`GET /poold/status` → `{vms:[{vm_id, state}]}` with `state ∈ allocated|ready|free|degraded`
-(allocated=leased, ready=prepared and gate-passed, free=dirty or preparing, degraded=quarantined).
+`GET /poold/status` → `{vms:[{vm_id, state, degraded_reason, ...}]}` with `state ∈ allocated|ready|degraded`
+(allocated=leased; ready=prepared, gate-passed, leasable now; degraded=anything else, with
+`degraded_reason ∈ preparing|dirty|quarantined|locked`). The contract's `free` is not emitted.
 With `auto_prepare = true` every dirty box is rolled back and gated as soon as it is idle, so a lease
 is instant when a box is `ready`; `release` marks the box dirty and it returns to `ready` in ~3 min.
 

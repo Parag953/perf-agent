@@ -233,7 +233,7 @@ class Poold:
         return v
 
     CONTRACT_STATE = {"leased": "allocated", "ready": "ready", "quarantined": "degraded",
-                      "dirty": "free", "preparing": "free"}
+                      "dirty": "degraded", "preparing": "degraded"}
 
     def vm_id(self, b: dict) -> str:
         return f"VM{b['vmid']}"
@@ -260,9 +260,12 @@ class Poold:
     def contract_vm(self, b: dict) -> dict:
         lock = self._locked(b)
         state = self.CONTRACT_STATE.get(b["state"], b["state"])
+        reason = None
+        if state == "degraded":
+            reason = b["state"]
         if lock and state == "ready":
-            state = "free"
-        v = {"vm_id": self.vm_id(b), "name": b["name"], "state": state,
+            state, reason = "degraded", "locked"
+        v = {"vm_id": self.vm_id(b), "name": b["name"], "state": state, "degraded_reason": reason,
              "poold_state": b["state"], "vm_lock": lock, **self._targets(b),
              "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(b["since"])) if b.get("since") else None}
         p = self.progress.get(b["name"])

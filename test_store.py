@@ -233,3 +233,21 @@ class TailscaleIp(unittest.TestCase):
         s = mk()
         s.set_ts_ip("andro-b", "100.73.230.48")
         self.assertEqual(s.box("andro-b")["ts_ip"], "100.73.230.48")
+
+
+class RestartKeepsExternalLeases(unittest.TestCase):
+    def test_external_lease_survives_recover_on_startup(self):
+        s = mk()
+        s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
+        lease = s.lease_external("andro-b", ttl_s=7200)
+        s.recover_on_startup()
+        b = s.box("andro-b")
+        self.assertEqual((b["state"], b["lease_id"]), ("leased", lease))
+
+    def test_internal_run_lease_is_reset_on_startup(self):
+        s = mk()
+        r = s.enqueue(task="a", owner="o", source="t", ttl_s=60)
+        s.dispatch(); s.mark_leased("andro-b", r["run_id"], ttl_s=60)
+        s.recover_on_startup()
+        self.assertEqual(s.box("andro-b")["state"], "dirty")
+        self.assertEqual(s.run(r["run_id"])["state"], "abandoned")
