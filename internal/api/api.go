@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Parag953/perf-agent/internal/model"
 )
@@ -19,6 +20,8 @@ type Engine interface {
 	Submit(model.Trigger) model.Task
 	Snapshot() model.State
 	GetMemory(id int64) (model.Memory, error)
+	TaskDetail(id string) (model.TaskDetail, error)
+	SubscribeTask(id string) (<-chan model.AgentEvent, func())
 }
 
 //go:embed dashboard.html
@@ -40,6 +43,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/stream", s.handleStream)
 	mux.HandleFunc("/api/memory/", s.handleMemory)
+	mux.HandleFunc("/api/task/", s.handleTask)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("/", s.handleRoot)
 	return mux
@@ -115,6 +119,68 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case b, ok := <-ch:
 			if !ok {
 				return
+			}
+			writeSSE(w, b)
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/task/")
+	id, tail, _ := strings.Cut(rest, "/")
+	if id == "" {
+		http.Error(w, "task id required", http.StatusBadRequest)
+		return
+	}
+	if tail == "stream" {
+		s.streamTask(w, r, id)
+		return
+	}
+	detail, err := s.eng.TaskDetail(id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// streamTask is a per-task SSE feed of the agent's run. It is deliberately
+// separate from /api/stream: transcripts are large and only the open drawer
+// wants them, so they must not ride along in every state broadcast.
+func (s *Server) streamTask(w http.ResponseWriter, r *http.Request, id string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("content-type", "text/event-stream")
+	w.Header().Set("cache-control", "no-cache")
+	w.Header().Set("connection", "keep-alive")
+	w.Header().Set("access-control-allow-origin", "*")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch, unsubscribe := s.eng.SubscribeTask(id)
+	defer unsubscribe()
+
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-keepalive.C:
+			w.Write([]byte(": keepalive\n\n"))
+			flusher.Flush()
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			b, err := json.Marshal(e)
+			if err != nil {
+				continue
 			}
 			writeSSE(w, b)
 			flusher.Flush()

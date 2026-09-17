@@ -109,5 +109,58 @@ func (c *httpClient) Status(ctx context.Context) ([]model.VM, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("poold status decode: %w", err)
 	}
+	c.mergePrepare(ctx, out.VMs)
 	return out.VMs, nil
+}
+
+// mergePrepare folds per-box prepare progress from GET /boxes into the contract
+// view, so a VM the pool is rebuilding can show what step it is on instead of
+// reading as an unexplained four-minute outage. Best effort: /boxes is a richer
+// debug endpoint and its absence must never fail status.
+func (c *httpClient) mergePrepare(ctx context.Context, vms []model.VM) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/boxes", nil)
+	if err != nil {
+		return
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	var boxes []struct {
+		VMID    int `json:"vmid"`
+		Prepare *struct {
+			Step    string  `json:"step"`
+			Attempt int     `json:"attempt"`
+			Elapsed float64 `json:"elapsed_s"`
+		} `json:"prepare"`
+		Gate *struct {
+			Sample string `json:"sample"`
+		} `json:"gate"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&boxes); err != nil {
+		return
+	}
+	byID := make(map[string]int, len(boxes))
+	for i, b := range boxes {
+		byID[fmt.Sprintf("VM%d", b.VMID)] = i
+	}
+	for i := range vms {
+		j, ok := byID[vms[i].VMID]
+		if !ok || boxes[j].Prepare == nil {
+			continue
+		}
+		p := &model.Prepare{
+			Step:    boxes[j].Prepare.Step,
+			Attempt: boxes[j].Prepare.Attempt,
+			Elapsed: boxes[j].Prepare.Elapsed,
+		}
+		if boxes[j].Gate != nil {
+			p.Sample = boxes[j].Gate.Sample
+		}
+		vms[i].Prepare = p
+	}
 }

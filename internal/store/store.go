@@ -42,7 +42,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // sqlite: serialize writers, avoids "database is locked"
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + taskSchema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 	return &Store{db: db}, nil

@@ -13,6 +13,7 @@ type Phase string
 
 const (
 	PhaseQueued     Phase = "queued"
+	PhaseWaiting    Phase = "waiting"
 	PhaseMatching   Phase = "matching"
 	PhaseLeasing    Phase = "leasing"
 	PhaseDispatched Phase = "dispatched"
@@ -67,23 +68,77 @@ type Task struct {
 	EnqueuedAt time.Time       `json:"enqueued_at"`
 	StartedAt  *time.Time      `json:"started_at,omitempty"`
 	FinishedAt *time.Time      `json:"finished_at,omitempty"`
+	QueuePos   int             `json:"queue_pos,omitempty"`
 	Payload    json.RawMessage `json:"-"`
+	Analysis   string          `json:"-"`
+	Summary    string          `json:"-"`
+}
+
+type EventKind string
+
+const (
+	EventSystem     EventKind = "system"
+	EventBootstrap  EventKind = "bootstrap"
+	EventThinking   EventKind = "thinking"
+	EventText       EventKind = "text"
+	EventTool       EventKind = "tool"
+	EventToolResult EventKind = "tool_result"
+	EventResult     EventKind = "result"
+	EventFailure    EventKind = "failure"
+)
+
+type AgentEvent struct {
+	TaskID string    `json:"task_id"`
+	Seq    int       `json:"seq"`
+	At     time.Time `json:"at"`
+	Kind   EventKind `json:"kind"`
+	Tool   string    `json:"tool,omitempty"`
+	Text   string    `json:"text,omitempty"`
+}
+
+type TaskDetail struct {
+	Task
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	Analysis string          `json:"analysis,omitempty"`
+	Summary  string          `json:"summary,omitempty"`
+	Events   []AgentEvent    `json:"events"`
 }
 
 // Clone returns a value copy safe to hand to the API layer.
 func (t *Task) Clone() Task {
 	c := *t
 	c.Payload = nil
+	c.Analysis = ""
+	c.Summary = ""
 	return c
+}
+
+func (t *Task) Detail(events []AgentEvent) TaskDetail {
+	if events == nil {
+		events = []AgentEvent{}
+	}
+	return TaskDetail{Task: t.Clone(), Payload: t.Payload, Analysis: t.Analysis, Summary: t.Summary, Events: events}
 }
 
 // VM is a pool VM as reported by poold.Status.
 type VM struct {
-	VMID   string     `json:"vm_id"`
-	State  VMState    `json:"state"`
-	Host   string     `json:"host,omitempty"`
-	TaskID string     `json:"task_id,omitempty"`
-	Since  *time.Time `json:"since,omitempty"`
+	VMID    string     `json:"vm_id"`
+	Name    string     `json:"name,omitempty"`
+	State   VMState    `json:"state"`
+	Host    string     `json:"host,omitempty"`
+	TaskID  string     `json:"task_id,omitempty"`
+	Service string     `json:"service,omitempty"`
+	Alert   string     `json:"alert,omitempty"`
+	Since   *time.Time `json:"since,omitempty"`
+	Reason  string     `json:"degraded_reason,omitempty"`
+	Prepare *Prepare   `json:"prepare,omitempty"`
+}
+
+type Prepare struct {
+	Step    string  `json:"step,omitempty"`
+	Attempt int     `json:"attempt,omitempty"`
+	Elapsed float64 `json:"elapsed_s,omitempty"`
+	Sample  string  `json:"gate_sample,omitempty"`
 }
 
 // Memory is one row of what we've learned — written from an agent's response.
@@ -132,6 +187,8 @@ type Stats struct {
 	VMsAllocated int     `json:"vms_allocated"`
 	VMsDegraded  int     `json:"vms_degraded"`
 	QueueDepth   int     `json:"queue_depth"`
+	Running      int     `json:"running"`
+	Completed    int     `json:"completed"`
 	TasksTotal   int     `json:"tasks_total"`
 	CacheHits    int     `json:"cache_hits"`
 	HitRate      float64 `json:"hit_rate"`
