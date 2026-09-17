@@ -2,11 +2,11 @@
 .env
 *.pem
 
-# Python
-__pycache__/
-*.pyc
-venv/
-.venv/
+# Go
+/bin/
+*.db
+*.out
+coverage.*
 
 # Local editor
 .vscode/

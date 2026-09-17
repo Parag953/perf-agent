@@ -1,0 +1,29 @@
+[Unit]
+Description=Perf-triage Agent Orchestrator (Go)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agent
+Group=agent
+WorkingDirectory=/opt/agent
+
+# Secrets + config — root-owned 0600, never committed anywhere.
+EnvironmentFile=/opt/agent/.env
+
+# PATH must include the agent tools the orchestrator shells out to (ssh; and
+# claude when LLM_BACKEND is unset/cli). AWS region for any S3 access.
+Environment=PATH=/usr/bin:/usr/local/bin
+Environment=AWS_DEFAULT_REGION=us-west-2
+
+ExecStart=/opt/agent/orchestrator
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orchestrator
+
+[Install]
+WantedBy=multi-user.target
