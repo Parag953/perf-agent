@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,11 +31,29 @@ type Config struct {
 	DispatchMode string
 	SSHKey       string // -i identity file for ssh dispatch
 
+	// VM bootstrap — a leased VM comes back blank, so before `claude -p` runs the
+	// orchestrator provisions it: install the tooling (claude, gh) if missing and
+	// inject the secrets the agent needs. Idempotent, so a pre-baked image no-ops.
+	VMBootstrap bool   // run the bootstrap step before dispatch (default true)
+	GHVersion   string // gh CLI version for the tarball fallback install
+
+	// Secrets forwarded into the VM's investigation run (never logged, written to
+	// a 0600 env file on the VM). All optional — set the ones the agent needs.
+	ClaudeOAuthToken   string // CLAUDE_CODE_OAUTH_TOKEN — headless claude auth
+	GHToken            string // GH_TOKEN/GITHUB_TOKEN — git push + gh pr create
+	DDApiKey           string // DD_API_KEY — datadog MCP (referenced by mcp.json)
+	DDAppKey           string // DD_APP_KEY — datadog MCP
+	AWSAccessKeyID     string
+	AWSSecretAccessKey string
+	AWSSessionToken    string
+	AWSRegion          string
+
 	// Agent runtime (paths are on the VM, not the orchestrator).
 	VoyagerPath   string
 	VoyagerRepo   string
 	S3Bucket      string
-	MCPConfig     string
+	MCPConfig     string // path claude --mcp-config reads on the VM (fallback if no content shipped)
+	MCPConfigSrc  string // path on the BOX to read mcp.json from; its content is shipped to the VM
 	AllowedTools  string
 	ClaudeTimeout time.Duration
 
@@ -55,14 +74,27 @@ func Load() Config {
 		llmBackend:      env("LLM_BACKEND", ""),
 		DispatchMode:    env("DISPATCH_MODE", "ssh"),
 		SSHKey:          env("SSH_KEY", ""),
-		VoyagerPath:     env("VOYAGER_PATH", "/opt/agent/voyager"),
-		VoyagerRepo:     env("VOYAGER_REPO", "andromedasec/voyager"),
-		S3Bucket:        env("S3_BUCKET", "as-live-heap-dump"),
-		MCPConfig:       env("MCP_CONFIG", "/opt/agent/mcp.json"),
-		AllowedTools:    env("ALLOWED_TOOLS", "Bash,Edit,Write,mcp__datadog__*,mcp__andromeda_gateway__*"),
-		ClaudeTimeout:   time.Duration(envInt("CLAUDE_TIMEOUT", 900)) * time.Second,
-		DBPath:          env("DB_PATH", "/opt/agent/memory.db"),
-		Workers:         envInt("WORKERS", 4),
+
+		VMBootstrap:        envBool("VM_BOOTSTRAP", true),
+		GHVersion:          env("GH_VERSION", "2.63.2"),
+		ClaudeOAuthToken:   env("CLAUDE_CODE_OAUTH_TOKEN", ""),
+		GHToken:            env("GH_TOKEN", env("GITHUB_TOKEN", "")),
+		DDApiKey:           env("DD_API_KEY", ""),
+		DDAppKey:           env("DD_APP_KEY", ""),
+		AWSAccessKeyID:     env("AWS_ACCESS_KEY_ID", ""),
+		AWSSecretAccessKey: env("AWS_SECRET_ACCESS_KEY", ""),
+		AWSSessionToken:    env("AWS_SESSION_TOKEN", ""),
+		AWSRegion:          env("AWS_REGION", env("AWS_DEFAULT_REGION", "us-west-2")),
+
+		VoyagerPath:   env("VOYAGER_PATH", "/opt/agent/voyager"),
+		VoyagerRepo:   env("VOYAGER_REPO", "andromedasec/voyager"),
+		S3Bucket:      env("S3_BUCKET", "as-live-heap-dump"),
+		MCPConfig:     env("MCP_CONFIG", "/opt/agent/mcp.json"),
+		MCPConfigSrc:  env("MCP_CONFIG_SRC", env("MCP_CONFIG", "/opt/agent/mcp.json")),
+		AllowedTools:  env("ALLOWED_TOOLS", "Bash,Edit,Write,mcp__datadog__*,mcp__andromeda_gateway__*"),
+		ClaudeTimeout: time.Duration(envInt("CLAUDE_TIMEOUT", 900)) * time.Second,
+		DBPath:        env("DB_PATH", "/opt/agent/memory.db"),
+		Workers:       envInt("WORKERS", 4),
 	}
 	return c
 }
@@ -93,4 +125,19 @@ func envInt(k string, def int) int {
 		}
 	}
 	return def
+}
+
+// envBool reads a boolean env var. "0", "false", "no", "off" (any case) are false;
+// any other non-empty value is true; unset falls back to def.
+func envBool(k string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }

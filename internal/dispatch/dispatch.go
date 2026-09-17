@@ -8,7 +8,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/Parag953/perf-agent/internal/config"
@@ -27,21 +29,46 @@ func New(cfg config.Config) Dispatcher {
 	if cfg.DispatchMode == "mock" {
 		return mockDispatcher{}
 	}
+	// Read the mcp.json to ship to the VM from the box's local filesystem. The
+	// snapshot the pool VMs boot from has no mcp.json, so the orchestrator writes
+	// it during bootstrap. Missing/unreadable => fall back to cfg.MCPConfig path.
+	var mcpContent string
+	if b, err := os.ReadFile(cfg.MCPConfigSrc); err == nil {
+		mcpContent = string(b)
+	}
+
 	return sshDispatcher{
 		key:          cfg.SSHKey,
 		claudeBin:    cfg.ClaudeBin,
 		mcpConfig:    cfg.MCPConfig,
+		mcpContent:   mcpContent,
 		allowedTools: cfg.AllowedTools,
+		bootstrap:    cfg.VMBootstrap,
+		ghVersion:    cfg.GHVersion,
+		secretEnv:    secretEnv(cfg),
 	}
 }
 
 // ---- SSH dispatcher (production) ----
 
+// remoteCredsPath / remoteMCPPath are where the bootstrap step writes the secrets
+// file and mcp.json on the VM. They use $HOME so they resolve in the non-login
+// shell ssh spawns; both are double-quoted for embedding in the remote command.
+const (
+	remoteCredsPath = `"$HOME/.config/agent/env"`
+	remoteMCPPath   = `"$HOME/.config/agent/mcp.json"`
+)
+
 type sshDispatcher struct {
 	key          string
 	claudeBin    string
 	mcpConfig    string
+	mcpContent   string // mcp.json to write on the VM; "" => use mcpConfig path as-is
 	allowedTools string
+
+	bootstrap bool              // provision the VM before the run
+	ghVersion string            // gh version for the tarball fallback
+	secretEnv map[string]string // forwarded into the run; never logged
 }
 
 func (d sshDispatcher) Mode() string { return "ssh" }
@@ -50,11 +77,39 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 	if sshTarget == "" {
 		return "", fmt.Errorf("ssh dispatch: empty ssh target")
 	}
-	// Remote command: claude reads the prompt from stdin (no prompt arg), so we
-	// pipe the (large) prompt over ssh stdin rather than into argv.
-	remote := fmt.Sprintf("%s -p --output-format json --mcp-config %s --allowedTools %s",
-		d.claudeBin, shellQuote(d.mcpConfig), shellQuote(d.allowedTools))
 
+	// 1. Provision the (blank) VM: install claude/gh if missing and drop the
+	//    secrets file. Idempotent — a pre-baked image makes this a fast no-op.
+	if d.bootstrap {
+		if err := d.doBootstrap(ctx, sshTarget); err != nil {
+			return "", err
+		}
+	}
+
+	// 2. Investigation run. Source the secrets file (so CLAUDE_CODE_OAUTH_TOKEN,
+	//    GH_TOKEN, AWS_*, DD_* are in the agent's env — claude expands the
+	//    ${DD_API_KEY} refs in mcp.json from there), put ~/.local/bin on PATH so
+	//    freshly-installed claude/gh/aws resolve, then run. claude reads the
+	//    (large) prompt from stdin, so we pipe it over ssh stdin, not argv.
+	mcpArg := shellQuote(d.mcpConfig)
+	if d.mcpContent != "" {
+		mcpArg = remoteMCPPath // bootstrap wrote it here; already double-quoted
+	}
+	remote := fmt.Sprintf(
+		`set -a; [ -f %s ] && . %s; set +a; export PATH="$HOME/.local/bin:$PATH"; %s -p --output-format json --mcp-config %s --allowedTools %s`,
+		remoteCredsPath, remoteCredsPath, d.claudeBin, mcpArg, shellQuote(d.allowedTools))
+
+	stdout, stderr, err := d.runSSH(ctx, sshTarget, remote, prompt)
+	if err != nil {
+		return "", fmt.Errorf("ssh dispatch: %v: %s", err, strings.TrimSpace(stderr))
+	}
+	return parseClaudeJSON([]byte(stdout)), nil
+}
+
+// runSSH executes one remote command over ssh, piping stdin to it, and returns
+// its stdout/stderr. stdin carries either the bootstrap script or the prompt —
+// never a secret in argv (secrets travel in the bootstrap script's stdin).
+func (d sshDispatcher) runSSH(ctx context.Context, sshTarget, remote, stdin string) (string, string, error) {
 	args := []string{}
 	if d.key != "" {
 		args = append(args, "-i", d.key)
@@ -65,13 +120,121 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 		sshTarget, remote,
 	)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("ssh dispatch: %v: %s", err, strings.TrimSpace(stderr.String()))
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+// doBootstrap ships the provisioning script to the VM over ssh stdin (so the
+// secrets it carries never appear in argv or the process list).
+func (d sshDispatcher) doBootstrap(ctx context.Context, sshTarget string) error {
+	stdout, stderr, err := d.runSSH(ctx, sshTarget, "bash -s", d.bootstrapScript())
+	if err != nil {
+		return fmt.Errorf("ssh bootstrap: %v: %s", err, strings.TrimSpace(stderr))
 	}
-	return parseClaudeJSON(stdout.Bytes()), nil
+	if !strings.Contains(stdout, "BOOTSTRAP_OK") {
+		return fmt.Errorf("ssh bootstrap: incomplete: %s", strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// bootstrapScript builds the idempotent provisioning script: write the secrets
+// to a 0600 env file, install claude and gh if absent, and wire gh as git's
+// credential helper. Every install is guarded by `command -v` so a VM that
+// already has the tooling pays only the cost of the checks.
+func (d sshDispatcher) bootstrapScript() string {
+	var env strings.Builder
+	keys := make([]string, 0, len(d.secretEnv))
+	for k := range d.secretEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&env, "export %s='%s'\n", k, strings.ReplaceAll(d.secretEnv[k], "'", `'\''`))
+	}
+
+	// mcp.json: the snapshot lacks it, so write it (env refs like ${DD_API_KEY}
+	// stay literal — claude expands them at run time from the sourced env).
+	mcpBlock := ""
+	if d.mcpContent != "" {
+		mcpBlock = fmt.Sprintf(`
+cat > "$HOME/.config/agent/mcp.json" <<'AGENT_MCP_EOF'
+%s
+AGENT_MCP_EOF
+chmod 600 "$HOME/.config/agent/mcp.json"
+`, strings.TrimRight(d.mcpContent, "\n"))
+	}
+
+	return fmt.Sprintf(`set -e
+export PATH="$HOME/.local/bin:$PATH"
+
+# 1. secrets -> a 0600 env file the investigation run sources
+mkdir -p "$HOME/.config/agent"
+umask 077
+cat > "$HOME/.config/agent/env" <<'AGENT_ENV_EOF'
+%sAGENT_ENV_EOF
+chmod 600 "$HOME/.config/agent/env"
+%s
+# 2. claude CLI (idempotent)
+if ! command -v claude >/dev/null 2>&1; then
+  curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || true
+fi
+
+# 3. gh CLI: package manager first, then a pinned tarball into ~/.local/bin
+if ! command -v gh >/dev/null 2>&1; then
+  (sudo -n dnf install -y gh || sudo -n yum install -y gh || sudo -n bash -c 'apt-get update && apt-get install -y gh') >/dev/null 2>&1 || true
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  arch=$(uname -m); case "$arch" in x86_64) a=amd64;; aarch64|arm64) a=arm64;; *) a=amd64;; esac
+  url="https://github.com/cli/cli/releases/download/v%s/gh_%s_linux_${a}.tar.gz"
+  tmp=$(mktemp -d)
+  if curl -fsSL "$url" -o "$tmp/gh.tgz"; then
+    tar -xzf "$tmp/gh.tgz" -C "$tmp" && mkdir -p "$HOME/.local/bin" && cp "$tmp"/gh_*/bin/gh "$HOME/.local/bin/gh" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+fi
+
+# 4. aws CLI v2 (snapshot lacks it) -> ~/.local/bin, no sudo for aws itself
+if ! command -v aws >/dev/null 2>&1; then
+  arch=$(uname -m)
+  tmp=$(mktemp -d)
+  if curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o "$tmp/aws.zip"; then
+    command -v unzip >/dev/null 2>&1 || (sudo -n dnf install -y unzip || sudo -n yum install -y unzip || sudo -n bash -c 'apt-get update && apt-get install -y unzip') >/dev/null 2>&1 || true
+    unzip -q "$tmp/aws.zip" -d "$tmp" && "$tmp/aws/install" --bin-dir "$HOME/.local/bin" --install-dir "$HOME/.local/aws-cli" --update >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp"
+fi
+
+# 5. let gh serve as git's credential helper for the push (needs GH_TOKEN)
+set -a; . "$HOME/.config/agent/env" 2>/dev/null; set +a
+command -v gh >/dev/null 2>&1 && gh auth setup-git >/dev/null 2>&1 || true
+
+echo BOOTSTRAP_OK
+`, env.String(), mcpBlock, d.ghVersion, d.ghVersion)
+}
+
+// secretEnv collects the non-empty secrets to forward into the VM's run.
+func secretEnv(cfg config.Config) map[string]string {
+	m := map[string]string{}
+	put := func(k, v string) {
+		if v != "" {
+			m[k] = v
+		}
+	}
+	put("CLAUDE_CODE_OAUTH_TOKEN", cfg.ClaudeOAuthToken)
+	put("ANTHROPIC_API_KEY", cfg.AnthropicAPIKey)
+	put("GH_TOKEN", cfg.GHToken)
+	put("GITHUB_TOKEN", cfg.GHToken)
+	put("DD_API_KEY", cfg.DDApiKey)
+	put("DD_APP_KEY", cfg.DDAppKey)
+	put("AWS_ACCESS_KEY_ID", cfg.AWSAccessKeyID)
+	put("AWS_SECRET_ACCESS_KEY", cfg.AWSSecretAccessKey)
+	put("AWS_SESSION_TOKEN", cfg.AWSSessionToken)
+	put("AWS_REGION", cfg.AWSRegion)
+	put("AWS_DEFAULT_REGION", cfg.AWSRegion)
+	return m
 }
 
 // parseClaudeJSON pulls `.result` out of `claude --output-format json`, falling
