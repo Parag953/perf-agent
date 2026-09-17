@@ -213,7 +213,7 @@ class Poold:
             return c[1]
         try:
             s = self.pve.status(vmid)
-            v = {"status": s.get("status"), "uptime_s": s.get("uptime"), "mem_bytes": s.get("mem")}
+            v = {"status": s.get("status"), "uptime_s": s.get("uptime"), "mem_bytes": s.get("mem"), "lock": s.get("lock")}
         except Exception as e:
             v = {"status": "unknown", "error": str(e)}
         self.vm_cache[vmid] = (time.time(), v)
@@ -244,12 +244,26 @@ class Poold:
                 return b
         return None
 
+    def _targets(self, b: dict) -> dict:
+        lan = b.get("ip")
+        ts = b.get("ts_ip")
+        prefer_ts = self.cfg.get("contract_ssh_via", "tailscale") == "tailscale" and bool(ts)
+        host = ts if prefer_ts else lan
+        return {"host": host,
+                "ssh_target": f"{b['ssh_user']}@{host}" if host else None,
+                "lan_host": lan, "lan_target": f"{b['ssh_user']}@{lan}" if lan else None,
+                "tailscale_host": ts, "tailscale_target": f"{b['ssh_user']}@{ts}" if ts else None}
+
+    def _locked(self, b: dict):
+        return self.vm_state(b["vmid"]).get("lock")
+
     def contract_vm(self, b: dict) -> dict:
-        v = {"vm_id": self.vm_id(b), "name": b["name"], "state": self.CONTRACT_STATE.get(b["state"], b["state"]),
-             "poold_state": b["state"], "host": b.get("ip"),
-             "ssh_target": f"{b['ssh_user']}@{b['ip']}" if b.get("ip") else None,
-             "tailscale_host": b.get("ts_ip"),
-             "tailscale_target": f"{b['ssh_user']}@{b['ts_ip']}" if b.get("ts_ip") else None,
+        lock = self._locked(b)
+        state = self.CONTRACT_STATE.get(b["state"], b["state"])
+        if lock and state == "ready":
+            state = "free"
+        v = {"vm_id": self.vm_id(b), "name": b["name"], "state": state,
+             "poold_state": b["state"], "vm_lock": lock, **self._targets(b),
              "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(b["since"])) if b.get("since") else None}
         p = self.progress.get(b["name"])
         if p and b["state"] == "preparing":
@@ -262,6 +276,9 @@ class Poold:
         name = self.store.pick_ready()
         if not name:
             return None
+        if self._locked(self.store.box(name)):
+            log(f"{name}: ready but Proxmox lock={self._locked(self.store.box(name))}; refusing lease")
+            return None
         ttl = self.cfg.get("lease", {}).get("external_ttl_s", 7200)
         try:
             lease_id = self.store.lease_external(name, ttl_s=ttl)
@@ -269,9 +286,7 @@ class Poold:
             return None
         b = self.store.box(name)
         log(f"{name}: leased to orchestrator lease={lease_id} host={b['ip']}")
-        return {"vm_id": self.vm_id(b), "host": b["ip"], "ssh_target": f"{b['ssh_user']}@{b['ip']}",
-                "tailscale_host": b.get("ts_ip"),
-                "tailscale_target": f"{b['ssh_user']}@{b['ts_ip']}" if b.get("ts_ip") else None,
+        return {"vm_id": self.vm_id(b), **self._targets(b),
                 "state": "allocated", "lease_id": lease_id, "expires_at": b["expires_at"]}
 
     def run_view(self, run_id):

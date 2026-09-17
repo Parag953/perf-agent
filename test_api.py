@@ -193,8 +193,10 @@ class OrchestratorContract(unittest.TestCase):
         code, body = http("POST", f"{self.base}/poold/lease")
         self.assertEqual(code, 200)
         self.assertEqual(body["vm_id"], "VM102")
-        self.assertEqual(body["host"], "10.0.0.38")
-        self.assertEqual(body["ssh_target"], "andro-2@10.0.0.38")
+        self.assertEqual(body["host"], "100.73.230.48")
+        self.assertEqual(body["ssh_target"], "andro-2@100.73.230.48")
+        self.assertEqual(body["lan_host"], "10.0.0.38")
+        self.assertEqual(body["lan_target"], "andro-2@10.0.0.38")
         self.assertEqual(body["state"], "allocated")
         self.assertEqual(self.vm()["state"], "allocated")
 
@@ -285,9 +287,14 @@ class TailscaleTarget(unittest.TestCase):
         v = http("GET", f"{self.base}/poold/status")[1]["vms"][0]
         self.assertEqual(v["tailscale_host"], "100.73.230.48")
         self.assertEqual(v["tailscale_target"], "andro-2@100.73.230.48")
+        self.assertEqual(v["ssh_target"], "andro-2@100.73.230.48")
+        self.assertEqual(v["lan_target"], "andro-2@10.0.0.38")
         _, lease = http("POST", f"{self.base}/poold/lease")
         self.assertEqual(lease["tailscale_target"], "andro-2@100.73.230.48")
-        self.assertEqual(lease["ssh_target"], "andro-2@10.0.0.38")
+        self.assertEqual(lease["ssh_target"], "andro-2@100.73.230.48")
+        self.assertEqual(lease["host"], "100.73.230.48")
+        self.assertEqual(lease["lan_host"], "10.0.0.38")
+        self.assertEqual(lease["lan_target"], "andro-2@10.0.0.38")
 
 
 class StartupAddressRefresh(unittest.TestCase):
@@ -302,8 +309,35 @@ class StartupAddressRefresh(unittest.TestCase):
         p.start()
         try:
             v = http("GET", f"http://127.0.0.1:{p.port}/poold/status")[1]["vms"][0]
-            self.assertEqual(v["host"], "10.0.0.38")
+            self.assertEqual(v["lan_host"], "10.0.0.38")
+            self.assertEqual(v["host"], "100.73.230.48")
             self.assertEqual(v["tailscale_host"], "100.73.230.48")
             self.assertEqual(pve.rollbacks, [])
+        finally:
+            p.stop()
+
+
+class ProxmoxLockAwareness(unittest.TestCase):
+    def test_a_ready_box_locked_by_proxmox_reads_free_in_the_contract(self):
+        pve, remote = FakePVE(), FakeRemote()
+        pve.lock = None
+        pve.status = lambda vmid: {"status": "running", "uptime": 5, "mem": 1, **({"lock": pve.lock} if pve.lock else {})}
+        cfg = {"listen": "127.0.0.1:0", "db": ":memory:", "trace_dir": __import__("tempfile").mkdtemp(),
+               "lan_prefix": "10.0.0.", "auto_prepare": True,
+               "boxes": [{"name": "andro-b", "vmid": 102, "ssh_user": "andro-2", "snapshot": "warm-live"}],
+               "gate": {"passes": 2, "interval_s": 0, "settle_s": 0, "timeout_s": 30, "expect_deploys": 13, "expect_ctx": "andromeda"},
+               "lease": {"default_ttl_s": 600, "heartbeat_grace_s": 90, "external_ttl_s": 7200},
+               "dispatch_interval_s": 0.05, "sweep_interval_s": 0.05}
+        p = Poold(cfg, pve=pve, remote=remote, gate_cfg=GateConfig(**cfg["gate"]))
+        p.start()
+        try:
+            base = f"http://127.0.0.1:{p.port}"
+            self.assertTrue(wait_for(lambda: http("GET", f"{base}/poold/status")[1]["vms"][0]["state"] == "ready", 10))
+            pve.lock = "snapshot"; p.vm_cache.clear()
+            v = http("GET", f"{base}/poold/status")[1]["vms"][0]
+            self.assertEqual((v["state"], v["poold_state"], v["vm_lock"]), ("free", "ready", "snapshot"))
+            self.assertEqual(http("POST", f"{base}/poold/lease")[0], 409)
+            pve.lock = None; p.vm_cache.clear()
+            self.assertEqual(http("GET", f"{base}/poold/status")[1]["vms"][0]["state"], "ready")
         finally:
             p.stop()

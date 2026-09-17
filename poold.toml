@@ -3,6 +3,7 @@ db = "/home/andro-3/poold/pool.db"
 trace_dir = "/home/andro-3/poold/traces"
 lan_prefix = "10.0.0."
 tailscale_prefix = "100."
+contract_ssh_via = "tailscale"
 dispatch_interval_s = 2.0
 sweep_interval_s = 30.0
 prepare_retries = 1

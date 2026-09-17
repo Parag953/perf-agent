@@ -20,6 +20,7 @@ state:"allocated"}` or `409 {error:"no_capacity"}`; `POST /poold/release {vm_id}
 With `auto_prepare = true` every dirty box is rolled back and gated as soon as it is idle, so a lease
 is instant when a box is `ready`; `release` marks the box dirty and it returns to `ready` in ~3 min.
 
-Lease and status responses also carry `tailscale_host` / `tailscale_target` (the box's tailnet
-address, resolved from the qemu guest agent at startup and on every prepare). Callers outside
-the LAN (the EC2 orchestrator) must SSH to `tailscale_target`; `ssh_target` is the LAN address.
+In the contract responses `host` / `ssh_target` are the box's **tailnet** address when one is known
+(`contract_ssh_via = "tailscale"`, the default, because the orchestrator is off-LAN); `lan_host` /
+`lan_target` and `tailscale_host` / `tailscale_target` are always present for callers that want to
+choose. Addresses come from the qemu guest agent at startup and on every prepare.
