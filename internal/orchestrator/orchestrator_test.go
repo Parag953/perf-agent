@@ -100,7 +100,7 @@ func TestPipeline_MissThenHit(t *testing.T) {
 	cfg := config.Config{Workers: 1, DispatchMode: "mock", ClaudeTimeout: 5 * time.Second}
 	disp := dispatch.New(cfg)
 	logger := log.New(io.Discard, "", 0)
-	o := New(cfg, &fakePoold{}, mem, fakeLLM{}, disp, nil, logger)
+	o := New(cfg, &fakePoold{}, mem, fakeLLM{}, disp, nil, nil, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

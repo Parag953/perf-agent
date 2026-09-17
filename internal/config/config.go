@@ -57,6 +57,12 @@ type Config struct {
 	AllowedTools  string
 	ClaudeTimeout time.Duration
 
+	// Slack — optional result notifications. When both are set, the orchestrator
+	// posts each finished investigation (analysis / PR) to the channel via
+	// chat.postMessage as the bot. Leave either empty to disable.
+	SlackBotToken string // SLACK_BOT_TOKEN — xoxb-… bot token with chat:write
+	SlackChannel  string // SLACK_CHANNEL — channel ID (e.g. C0C1SH00CP9) or #name
+
 	// Memory
 	DBPath string
 
@@ -101,6 +107,8 @@ func Load() Config {
 		MCPConfigSrc:  env("MCP_CONFIG_SRC", env("MCP_CONFIG", "/opt/agent/mcp.json")),
 		AllowedTools:  env("ALLOWED_TOOLS", "Bash,Edit,Write,mcp__datadog__*,mcp__andromeda_gateway__*"),
 		ClaudeTimeout: time.Duration(envInt("CLAUDE_TIMEOUT", 900)) * time.Second,
+		SlackBotToken: env("SLACK_BOT_TOKEN", ""),
+		SlackChannel:  env("SLACK_CHANNEL", ""),
 		DBPath:        env("DB_PATH", "/opt/agent/memory.db"),
 		Workers:       envInt("WORKERS", 4),
 		QueuePoll:     time.Duration(envInt("QUEUE_POLL_SECS", 5)) * time.Second,

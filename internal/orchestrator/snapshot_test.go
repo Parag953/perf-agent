@@ -26,7 +26,7 @@ func TestSnapshot_NeverNull(t *testing.T) {
 	defer mem.Close()
 
 	cfg := config.Config{Workers: 1, DispatchMode: "mock"}
-	o := New(cfg, &fakePoold{}, mem, fakeLLM{}, dispatch.New(cfg), nil, log.New(io.Discard, "", 0))
+	o := New(cfg, &fakePoold{}, mem, fakeLLM{}, dispatch.New(cfg), nil, nil, log.New(io.Discard, "", 0))
 
 	snap := o.Snapshot()
 	if snap.VMs == nil || snap.Tasks == nil || snap.Memory == nil {
