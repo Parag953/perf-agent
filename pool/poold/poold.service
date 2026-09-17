@@ -1,0 +1,12 @@
+[Unit]
+Description=poold - VM pool lease and reset authority
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/poold
+ExecStart=/usr/bin/python3 %h/poold/poold.py %h/poold/poold.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
