@@ -109,19 +109,24 @@ Host needs `/opt/agent/.env` (root-owned 0600). A leased VM comes back blank.
 Before each `claude -p` run the SSH dispatcher **provisions the leased VM** so the
 agent can actually do its job (`internal/dispatch/dispatch.go`, `VM_BOOTSTRAP=true`):
 
-1. **Secrets** — writes `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`/`GITHUB_TOKEN`, and
-   `AWS_*` from the box's `/opt/agent/.env` to `~/.config/agent/env` on the VM
-   (chmod 600). Travels over the ssh *stdin*, never argv, so it isn't in `ps`. The
-   investigation run then `source`s that file so `claude`, `gh`, and `aws` are
-   authenticated.
-2. **`claude`** — `command -v claude || curl -fsSL https://claude.ai/install.sh | bash`.
-3. **`gh`** — package manager, then a pinned tarball (`GH_VERSION`) into
+1. **Secrets** — writes `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`/`GITHUB_TOKEN`,
+   `DD_API_KEY`/`DD_APP_KEY`, and `AWS_*` from the box's `/opt/agent/.env` to
+   `~/.config/agent/env` on the VM (chmod 600). Travels over the ssh *stdin*, never
+   argv, so it isn't in `ps`. The run `source`s it so `claude`/`gh`/`aws` are
+   authenticated and claude can expand the `${DD_API_KEY}` refs in mcp.json.
+2. **`mcp.json`** — the pool VMs boot from a stable snapshot that has no mcp.json,
+   so the box ships its own (`MCP_CONFIG_SRC`) to `~/.config/agent/mcp.json` and
+   points `--mcp-config` there. Env refs stay literal; claude expands them at run time.
+3. **`claude`** — `command -v claude || curl -fsSL https://claude.ai/install.sh | bash`.
+4. **`gh`** — package manager, then a pinned tarball (`GH_VERSION`) into
    `~/.local/bin`; then `gh auth setup-git` so `git push` and `gh pr create` both work.
+5. **`aws` CLI v2** — the snapshot also lacks it; installed into `~/.local/bin`.
 
 Every step is guarded by `command -v`, so a **pre-baked golden image no-ops** (only
-the secrets file is rewritten) — bootstrap is a self-healing safety net, not a
-per-task installer. `go`, `aws`, and the voyager checkout are expected on the image;
-mint the Claude token with `claude setup-token`.
+the secrets + mcp.json files are rewritten) — bootstrap is a self-healing safety net,
+not a per-task installer. The snapshot is expected to carry `go`, the voyager
+checkout, kubectl and the local k8s cluster. Mint the Claude token with
+`claude setup-token`.
 
 ## Not built yet (intentionally mocked / deferred)
 

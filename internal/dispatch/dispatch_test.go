@@ -18,7 +18,10 @@ func TestBootstrapScript(t *testing.T) {
 		ClaudeBin:        "claude",
 		ClaudeOAuthToken: "sk-ant-oat-secret",
 		GHToken:          "ghp_secret",
+		DDApiKey:         "dd-api-secret",
+		DDAppKey:         "dd-app-secret",
 		AWSAccessKeyID:   "AKIAEXAMPLE",
+		MCPConfigSrc:     "/no/such/file", // unreadable => no mcp block
 	}).(sshDispatcher)
 
 	s := d.bootstrapScript()
@@ -27,10 +30,14 @@ func TestBootstrapScript(t *testing.T) {
 		"export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat-secret'",
 		"export GH_TOKEN='ghp_secret'",
 		"export GITHUB_TOKEN='ghp_secret'",
+		"export DD_API_KEY='dd-api-secret'",
+		"export DD_APP_KEY='dd-app-secret'",
 		"export AWS_ACCESS_KEY_ID='AKIAEXAMPLE'",
 		"command -v claude", // guarded install
 		"command -v gh",
-		"releases/download/v2.63.2/gh_2.63.2_linux_", // pinned tarball fallback
+		"command -v aws",                             // aws v2 install
+		"awscli-exe-linux",                           // aws installer url
+		"releases/download/v2.63.2/gh_2.63.2_linux_", // pinned gh tarball fallback
 		"gh auth setup-git",
 		"chmod 600",
 		"echo BOOTSTRAP_OK",
@@ -42,6 +49,26 @@ func TestBootstrapScript(t *testing.T) {
 	// An unset secret must not appear at all.
 	if strings.Contains(s, "AWS_SESSION_TOKEN") {
 		t.Error("unset secret AWS_SESSION_TOKEN should be omitted")
+	}
+}
+
+// When mcp.json content is present it must be written on the VM with its
+// ${DD_API_KEY} refs left literal (claude expands them at run time), and the run
+// must point --mcp-config at the written file.
+func TestBootstrapShipsMCP(t *testing.T) {
+	d := sshDispatcher{
+		claudeBin:  "claude",
+		mcpConfig:  "/opt/agent/mcp.json",
+		mcpContent: `{"mcpServers":{"datadog":{"headers":{"DD_API_KEY":"${DD_API_KEY}"}}}}`,
+		ghVersion:  "2.63.2",
+		secretEnv:  map[string]string{"DD_API_KEY": "z"},
+	}
+	s := d.bootstrapScript()
+	if !strings.Contains(s, "AGENT_MCP_EOF") {
+		t.Error("mcp.json heredoc missing")
+	}
+	if !strings.Contains(s, `"DD_API_KEY":"${DD_API_KEY}"`) {
+		t.Error("mcp.json env ref should be written literally, not expanded")
 	}
 }
 

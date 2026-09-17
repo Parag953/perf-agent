@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -28,10 +29,19 @@ func New(cfg config.Config) Dispatcher {
 	if cfg.DispatchMode == "mock" {
 		return mockDispatcher{}
 	}
+	// Read the mcp.json to ship to the VM from the box's local filesystem. The
+	// snapshot the pool VMs boot from has no mcp.json, so the orchestrator writes
+	// it during bootstrap. Missing/unreadable => fall back to cfg.MCPConfig path.
+	var mcpContent string
+	if b, err := os.ReadFile(cfg.MCPConfigSrc); err == nil {
+		mcpContent = string(b)
+	}
+
 	return sshDispatcher{
 		key:          cfg.SSHKey,
 		claudeBin:    cfg.ClaudeBin,
 		mcpConfig:    cfg.MCPConfig,
+		mcpContent:   mcpContent,
 		allowedTools: cfg.AllowedTools,
 		bootstrap:    cfg.VMBootstrap,
 		ghVersion:    cfg.GHVersion,
@@ -41,15 +51,19 @@ func New(cfg config.Config) Dispatcher {
 
 // ---- SSH dispatcher (production) ----
 
-// remoteCredsPath is where the bootstrap step writes the injected secrets on the
-// VM; the investigation run sources it. Uses $HOME so it resolves in the
-// non-login shell that ssh spawns.
-const remoteCredsPath = `"$HOME/.config/agent/env"`
+// remoteCredsPath / remoteMCPPath are where the bootstrap step writes the secrets
+// file and mcp.json on the VM. They use $HOME so they resolve in the non-login
+// shell ssh spawns; both are double-quoted for embedding in the remote command.
+const (
+	remoteCredsPath = `"$HOME/.config/agent/env"`
+	remoteMCPPath   = `"$HOME/.config/agent/mcp.json"`
+)
 
 type sshDispatcher struct {
 	key          string
 	claudeBin    string
 	mcpConfig    string
+	mcpContent   string // mcp.json to write on the VM; "" => use mcpConfig path as-is
 	allowedTools string
 
 	bootstrap bool              // provision the VM before the run
@@ -73,12 +87,17 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 	}
 
 	// 2. Investigation run. Source the secrets file (so CLAUDE_CODE_OAUTH_TOKEN,
-	//    GH_TOKEN, AWS_* are in the agent's env), put ~/.local/bin on PATH so a
-	//    freshly-installed claude/gh resolves, then run. claude reads the (large)
-	//    prompt from stdin, so we pipe it over ssh stdin rather than into argv.
+	//    GH_TOKEN, AWS_*, DD_* are in the agent's env — claude expands the
+	//    ${DD_API_KEY} refs in mcp.json from there), put ~/.local/bin on PATH so
+	//    freshly-installed claude/gh/aws resolve, then run. claude reads the
+	//    (large) prompt from stdin, so we pipe it over ssh stdin, not argv.
+	mcpArg := shellQuote(d.mcpConfig)
+	if d.mcpContent != "" {
+		mcpArg = remoteMCPPath // bootstrap wrote it here; already double-quoted
+	}
 	remote := fmt.Sprintf(
 		`set -a; [ -f %s ] && . %s; set +a; export PATH="$HOME/.local/bin:$PATH"; %s -p --output-format json --mcp-config %s --allowedTools %s`,
-		remoteCredsPath, remoteCredsPath, d.claudeBin, shellQuote(d.mcpConfig), shellQuote(d.allowedTools))
+		remoteCredsPath, remoteCredsPath, d.claudeBin, mcpArg, shellQuote(d.allowedTools))
 
 	stdout, stderr, err := d.runSSH(ctx, sshTarget, remote, prompt)
 	if err != nil {
@@ -136,6 +155,18 @@ func (d sshDispatcher) bootstrapScript() string {
 		fmt.Fprintf(&env, "export %s='%s'\n", k, strings.ReplaceAll(d.secretEnv[k], "'", `'\''`))
 	}
 
+	// mcp.json: the snapshot lacks it, so write it (env refs like ${DD_API_KEY}
+	// stay literal — claude expands them at run time from the sourced env).
+	mcpBlock := ""
+	if d.mcpContent != "" {
+		mcpBlock = fmt.Sprintf(`
+cat > "$HOME/.config/agent/mcp.json" <<'AGENT_MCP_EOF'
+%s
+AGENT_MCP_EOF
+chmod 600 "$HOME/.config/agent/mcp.json"
+`, strings.TrimRight(d.mcpContent, "\n"))
+	}
+
 	return fmt.Sprintf(`set -e
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -145,7 +176,7 @@ umask 077
 cat > "$HOME/.config/agent/env" <<'AGENT_ENV_EOF'
 %sAGENT_ENV_EOF
 chmod 600 "$HOME/.config/agent/env"
-
+%s
 # 2. claude CLI (idempotent)
 if ! command -v claude >/dev/null 2>&1; then
   curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || true
@@ -165,12 +196,23 @@ if ! command -v gh >/dev/null 2>&1; then
   rm -rf "$tmp"
 fi
 
-# 4. let gh serve as git's credential helper for the push (needs GH_TOKEN)
+# 4. aws CLI v2 (snapshot lacks it) -> ~/.local/bin, no sudo for aws itself
+if ! command -v aws >/dev/null 2>&1; then
+  arch=$(uname -m)
+  tmp=$(mktemp -d)
+  if curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" -o "$tmp/aws.zip"; then
+    command -v unzip >/dev/null 2>&1 || (sudo -n dnf install -y unzip || sudo -n yum install -y unzip || sudo -n bash -c 'apt-get update && apt-get install -y unzip') >/dev/null 2>&1 || true
+    unzip -q "$tmp/aws.zip" -d "$tmp" && "$tmp/aws/install" --bin-dir "$HOME/.local/bin" --install-dir "$HOME/.local/aws-cli" --update >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp"
+fi
+
+# 5. let gh serve as git's credential helper for the push (needs GH_TOKEN)
 set -a; . "$HOME/.config/agent/env" 2>/dev/null; set +a
 command -v gh >/dev/null 2>&1 && gh auth setup-git >/dev/null 2>&1 || true
 
 echo BOOTSTRAP_OK
-`, env.String(), d.ghVersion, d.ghVersion)
+`, env.String(), mcpBlock, d.ghVersion, d.ghVersion)
 }
 
 // secretEnv collects the non-empty secrets to forward into the VM's run.
@@ -185,6 +227,8 @@ func secretEnv(cfg config.Config) map[string]string {
 	put("ANTHROPIC_API_KEY", cfg.AnthropicAPIKey)
 	put("GH_TOKEN", cfg.GHToken)
 	put("GITHUB_TOKEN", cfg.GHToken)
+	put("DD_API_KEY", cfg.DDApiKey)
+	put("DD_APP_KEY", cfg.DDAppKey)
 	put("AWS_ACCESS_KEY_ID", cfg.AWSAccessKeyID)
 	put("AWS_SECRET_ACCESS_KEY", cfg.AWSSecretAccessKey)
 	put("AWS_SESSION_TOKEN", cfg.AWSSessionToken)

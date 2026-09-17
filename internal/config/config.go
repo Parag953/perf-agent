@@ -41,6 +41,8 @@ type Config struct {
 	// a 0600 env file on the VM). All optional — set the ones the agent needs.
 	ClaudeOAuthToken   string // CLAUDE_CODE_OAUTH_TOKEN — headless claude auth
 	GHToken            string // GH_TOKEN/GITHUB_TOKEN — git push + gh pr create
+	DDApiKey           string // DD_API_KEY — datadog MCP (referenced by mcp.json)
+	DDAppKey           string // DD_APP_KEY — datadog MCP
 	AWSAccessKeyID     string
 	AWSSecretAccessKey string
 	AWSSessionToken    string
@@ -50,7 +52,8 @@ type Config struct {
 	VoyagerPath   string
 	VoyagerRepo   string
 	S3Bucket      string
-	MCPConfig     string
+	MCPConfig     string // path claude --mcp-config reads on the VM (fallback if no content shipped)
+	MCPConfigSrc  string // path on the BOX to read mcp.json from; its content is shipped to the VM
 	AllowedTools  string
 	ClaudeTimeout time.Duration
 
@@ -76,6 +79,8 @@ func Load() Config {
 		GHVersion:          env("GH_VERSION", "2.63.2"),
 		ClaudeOAuthToken:   env("CLAUDE_CODE_OAUTH_TOKEN", ""),
 		GHToken:            env("GH_TOKEN", env("GITHUB_TOKEN", "")),
+		DDApiKey:           env("DD_API_KEY", ""),
+		DDAppKey:           env("DD_APP_KEY", ""),
 		AWSAccessKeyID:     env("AWS_ACCESS_KEY_ID", ""),
 		AWSSecretAccessKey: env("AWS_SECRET_ACCESS_KEY", ""),
 		AWSSessionToken:    env("AWS_SESSION_TOKEN", ""),
@@ -85,6 +90,7 @@ func Load() Config {
 		VoyagerRepo:   env("VOYAGER_REPO", "andromedasec/voyager"),
 		S3Bucket:      env("S3_BUCKET", "as-live-heap-dump"),
 		MCPConfig:     env("MCP_CONFIG", "/opt/agent/mcp.json"),
+		MCPConfigSrc:  env("MCP_CONFIG_SRC", env("MCP_CONFIG", "/opt/agent/mcp.json")),
 		AllowedTools:  env("ALLOWED_TOOLS", "Bash,Edit,Write,mcp__datadog__*,mcp__andromeda_gateway__*"),
 		ClaudeTimeout: time.Duration(envInt("CLAUDE_TIMEOUT", 900)) * time.Second,
 		DBPath:        env("DB_PATH", "/opt/agent/memory.db"),
