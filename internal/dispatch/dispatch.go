@@ -379,6 +379,8 @@ applies here before assuming it does; do not blindly trust it:
 	return fmt.Sprintf(`You are an on-call Go engineer for the Voyager platform. A Datadog alert just fired.
 Investigate and resolve it the way a developer would: form hypotheses, gather ONLY the
 evidence you actually need, and drive to a concrete root cause. Do not gather data you don't need.
+Do NOT build the project during your analysis — no "go build", "make", "make gen", "make dev.refresh",
+or any other build/codegen step. Read and reason about the code statically instead.
 
 Alert: %s
 Service: %s
@@ -411,7 +413,9 @@ Deliver a clear root-cause analysis with concrete, code-level fixes.
 
 FIX & PR:
 If — and only if — you are confident in a concrete, well-scoped code fix, implement it and
-open a DRAFT pull request (do NOT merge it yourself):
+open a DRAFT pull request (do NOT merge it yourself). Make ONLY the source-code changes for the
+fix — do NOT run any build or codegen while preparing the PR: no "go build", "make", "make gen",
+"make dev.refresh", or similar. Just edit the code, commit, push, and open the PR:
   cd %s
   git checkout -b agent/%s-<short-slug>
   git add -A && git commit -m "<clear message explaining the fix>"
