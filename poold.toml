@@ -1,0 +1,31 @@
+listen = "0.0.0.0:7070"
+db = "/home/andro-1/poold/pool.db"
+trace_dir = "/home/andro-1/poold/traces"
+lan_prefix = "10.0.0."
+dispatch_interval_s = 2.0
+sweep_interval_s = 30.0
+prepare_retries = 1
+
+[pve]
+url = "https://10.0.0.213:8006"
+token_file = "~/.config/pve/token"
+node = "server1"
+
+[gate]
+passes = 4
+interval_s = 10
+settle_s = 120
+timeout_s = 600
+expect_deploys = 13
+expect_ctx = "andromeda"
+
+[lease]
+default_ttl_s = 3600
+heartbeat_grace_s = 90
+
+[[boxes]]
+name = "andro-b"
+vmid = 102
+ssh_user = "andro-2"
+ip = "10.0.0.38"
+snapshot = "warm-live"
