@@ -82,6 +82,53 @@ func (c *apiClient) Complete(ctx context.Context, system, user string) (string, 
 	return sb.String(), nil
 }
 
+// unavailableMarkers are failures that mean the model cannot serve this request
+// at all — quota, auth, or a missing binary. They are worth distinguishing,
+// because an agent run would hit exactly the same wall, so leasing a VM for it
+// spends a four-minute pool reset to learn nothing.
+var unavailableMarkers = []string{
+	"session limit",
+	"usage limit",
+	"rate_limit",
+	"credit balance",
+	"authentication_error",
+	"permission_error",
+	"overloaded",
+	"executable file not found",
+}
+
+// Unavailable reports whether err means the model itself is unusable, as opposed
+// to this one call going wrong.
+func Unavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range unavailableMarkers {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// cliDetail merges the CLI's streams for an error message. claude reports quota
+// and auth problems on STDOUT, so reporting stderr alone yields a bare
+// "exit status 1:" that hides the only useful sentence.
+func cliDetail(stdout, stderr string) string {
+	parts := []string{}
+	for _, s := range []string{strings.TrimSpace(stderr), strings.TrimSpace(stdout)} {
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	joined := strings.Join(parts, "; ")
+	if len(joined) > 300 {
+		joined = joined[:300] + "…"
+	}
+	return joined
+}
+
 // ---- claude CLI backend ----
 
 type cliClient struct {
@@ -109,7 +156,7 @@ func (c *cliClient) Complete(ctx context.Context, system, user string) (string, 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("claude cli: %v: %s", err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("claude cli: %v: %s", err, cliDetail(stdout.String(), stderr.String()))
 	}
 	var out struct {
 		Result string `json:"result"`

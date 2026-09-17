@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -348,5 +349,46 @@ func TestSubscribeReceivesLiveEventsForARunningTask(t *testing.T) {
 		}
 	case <-time.After(8 * time.Second):
 		t.Fatal("no live event arrived for the running task")
+	}
+}
+
+type deadLLM struct{}
+
+func (deadLLM) Backend() string { return "dead" }
+func (deadLLM) Complete(context.Context, string, string) (string, error) {
+	return "", fmt.Errorf("claude cli: exit status 1: You've hit your session limit · resets 1:50pm (UTC)")
+}
+
+func TestModelUnavailableFailsTheTaskWithoutSpendingAVM(t *testing.T) {
+	pool := newCapPoold(2)
+	mem, err := store.Open(filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mem.Close() })
+	cfg := config.Config{DispatchMode: "mock", ClaudeTimeout: 10 * time.Second, QueuePoll: 20 * time.Millisecond}
+	o := New(cfg, pool, mem, deadLLM{}, dispatch.New(cfg), nil, log.New(io.Discard, "", 0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o.Start(ctx)
+
+	task := o.Submit(model.Trigger{Service: "tachyon", Alert: "heap", Payload: json.RawMessage(`{}`)})
+
+	waitFor(t, "task to fail fast", func() bool {
+		tk, ok := findTask(o, task.ID)
+		return ok && isTerminal(tk.Phase)
+	})
+	time.Sleep(200 * time.Millisecond)
+
+	tk, _ := findTask(o, task.ID)
+	if tk.Phase != model.PhaseError {
+		t.Errorf("phase = %s, want error", tk.Phase)
+	}
+	if !strings.Contains(tk.Error, "session limit") {
+		t.Errorf("error = %q, want it to name the real reason", tk.Error)
+	}
+	if n := pool.leaseCount(); n != 0 {
+		t.Errorf("leased %d VMs, want 0 — an unusable model must not burn a lease and a 4-minute reset", n)
 	}
 }

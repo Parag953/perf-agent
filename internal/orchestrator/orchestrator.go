@@ -182,6 +182,10 @@ func (o *Orchestrator) intake(task *model.Task) {
 
 	trigger := model.Trigger{Service: task.Service, Alert: task.Alert, Payload: task.Payload}
 	sig, err := llm.Signature(ctx, o.llm, trigger)
+	if err != nil && llm.Unavailable(err) {
+		o.fail(task, fmt.Errorf("model unavailable, refusing to spend a VM: %w", err))
+		return
+	}
 	if err != nil {
 		o.log.Printf("task %s: signature failed: %v", task.ID, err)
 	} else {
