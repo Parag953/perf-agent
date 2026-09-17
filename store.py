@@ -32,7 +32,7 @@ class Store:
             self._migrate()
 
     def _migrate(self):
-        want = {"boxes": {"heartbeat_required": "INTEGER NOT NULL DEFAULT 1"}}
+        want = {"boxes": {"heartbeat_required": "INTEGER NOT NULL DEFAULT 1", "ts_ip": "TEXT"}}
         for table, cols in want.items():
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for col, decl in cols.items():
@@ -68,6 +68,10 @@ class Store:
 
     def queue(self) -> list:
         return [r["run_id"] for r in self.db.execute("SELECT run_id FROM runs WHERE state='queued' ORDER BY seq")]
+
+    def set_ts_ip(self, name, ip):
+        with self._tx():
+            self.db.execute("UPDATE boxes SET ts_ip=? WHERE name=?", (ip, name))
 
     def set_ip(self, name, ip):
         with self._tx():

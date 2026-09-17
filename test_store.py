@@ -226,3 +226,10 @@ class Migration(unittest.TestCase):
         s.lease_external("andro-b", ttl_s=10)
         self.assertEqual(s.box("andro-b")["heartbeat_required"], 0)
         self.assertEqual(s.sweep(now=1e12), [])
+
+
+class TailscaleIp(unittest.TestCase):
+    def test_set_ts_ip_persists(self):
+        s = mk()
+        s.set_ts_ip("andro-b", "100.73.230.48")
+        self.assertEqual(s.box("andro-b")["ts_ip"], "100.73.230.48")

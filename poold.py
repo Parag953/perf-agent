@@ -25,6 +25,7 @@ class Poold:
         self.trace_dir = cfg.get("trace_dir", "traces")
         os.makedirs(self.trace_dir, exist_ok=True)
         self.lan_prefix = cfg.get("lan_prefix", "10.0.0.")
+        self.ts_prefix = cfg.get("tailscale_prefix", "100.")
         for b in cfg["boxes"]:
             self.store.ensure_box(b["name"], b["vmid"], b["ssh_user"], b.get("ip"), b.get("snapshot", "warm-live"))
         self.store.recover_on_startup()
@@ -116,6 +117,9 @@ class Poold:
             ip = self.pve.guest_ipv4(vmid, self.lan_prefix)
             if ip:
                 self.store.set_ip(box_name, ip)
+                ts = self.pve.guest_ipv4(vmid, self.ts_prefix)
+                if ts:
+                    self.store.set_ts_ip(box_name, ts)
             return ip
 
         def gate_sample(ip):
@@ -203,7 +207,7 @@ class Poold:
         return v
 
     def box_view(self, b: dict) -> dict:
-        v = {k: b.get(k) for k in ("name", "vmid", "ssh_user", "ip", "state", "since", "lease_id", "run_id",
+        v = {k: b.get(k) for k in ("name", "vmid", "ssh_user", "ip", "ts_ip", "state", "since", "lease_id", "run_id",
                                     "snapshot", "fail_count", "last_error", "expires_at", "last_heartbeat")}
         v["vm"] = self.vm_state(b["vmid"])
         p = self.progress.get(b["name"])
@@ -231,6 +235,8 @@ class Poold:
         v = {"vm_id": self.vm_id(b), "name": b["name"], "state": self.CONTRACT_STATE.get(b["state"], b["state"]),
              "poold_state": b["state"], "host": b.get("ip"),
              "ssh_target": f"{b['ssh_user']}@{b['ip']}" if b.get("ip") else None,
+             "tailscale_host": b.get("ts_ip"),
+             "tailscale_target": f"{b['ssh_user']}@{b['ts_ip']}" if b.get("ts_ip") else None,
              "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(b["since"])) if b.get("since") else None}
         p = self.progress.get(b["name"])
         if p and b["state"] == "preparing":
@@ -251,6 +257,8 @@ class Poold:
         b = self.store.box(name)
         log(f"{name}: leased to orchestrator lease={lease_id} host={b['ip']}")
         return {"vm_id": self.vm_id(b), "host": b["ip"], "ssh_target": f"{b['ssh_user']}@{b['ip']}",
+                "tailscale_host": b.get("ts_ip"),
+                "tailscale_target": f"{b['ssh_user']}@{b['ts_ip']}" if b.get("ts_ip") else None,
                 "state": "allocated", "lease_id": lease_id, "expires_at": b["expires_at"]}
 
     def run_view(self, run_id):

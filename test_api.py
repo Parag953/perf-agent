@@ -26,7 +26,7 @@ class FakePVE:
         return {"status": "stopped", "exitstatus": "OK"}
 
     def guest_ipv4(self, vmid, prefix):
-        return "10.0.0.38"
+        return {"10.0.0.": "10.0.0.38", "100.": "100.73.230.48"}.get(prefix)
 
 
 class FakeRemote:
@@ -259,3 +259,32 @@ class ReadyBoxHandover(unittest.TestCase):
         self.assertTrue(wait_for(lambda: http("GET", f"{self.base}/boxes/andro-b")[1]["state"] == "ready", 10))
         v = http("GET", f"{self.base}/poold/status")[1]["vms"][0]
         self.assertEqual((v["state"], v["poold_state"]), ("ready", "ready"))
+
+
+class TailscaleTarget(unittest.TestCase):
+    def setUp(self):
+        self.pve, self.remote = FakePVE(), FakeRemote()
+        self.tmp = __import__("tempfile").mkdtemp()
+        cfg = {
+            "listen": "127.0.0.1:0", "db": ":memory:", "trace_dir": self.tmp, "lan_prefix": "10.0.0.",
+            "tailscale_prefix": "100.", "auto_prepare": True,
+            "boxes": [{"name": "andro-b", "vmid": 102, "ssh_user": "andro-2", "snapshot": "warm-live"}],
+            "gate": {"passes": 2, "interval_s": 0, "settle_s": 0, "timeout_s": 30, "expect_deploys": 13, "expect_ctx": "andromeda"},
+            "lease": {"default_ttl_s": 600, "heartbeat_grace_s": 90, "external_ttl_s": 7200},
+            "dispatch_interval_s": 0.05, "sweep_interval_s": 0.05,
+        }
+        self.p = Poold(cfg, pve=self.pve, remote=self.remote, gate_cfg=GateConfig(**cfg["gate"]))
+        self.p.start()
+        self.base = f"http://127.0.0.1:{self.p.port}"
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_status_and_lease_carry_tailscale_target(self):
+        self.assertTrue(wait_for(lambda: http("GET", f"{self.base}/poold/status")[1]["vms"][0]["state"] == "ready", 10))
+        v = http("GET", f"{self.base}/poold/status")[1]["vms"][0]
+        self.assertEqual(v["tailscale_host"], "100.73.230.48")
+        self.assertEqual(v["tailscale_target"], "andro-2@100.73.230.48")
+        _, lease = http("POST", f"{self.base}/poold/lease")
+        self.assertEqual(lease["tailscale_target"], "andro-2@100.73.230.48")
+        self.assertEqual(lease["ssh_target"], "andro-2@10.0.0.38")
