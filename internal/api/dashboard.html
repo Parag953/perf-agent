@@ -178,7 +178,7 @@
   .ev.bootstrap .tag,.ev.system .tag{color:var(--warn);background:rgba(255,176,32,.1)}
   .ev.result .tag{color:var(--ok);background:rgba(61,220,132,.12)}
   .ev.failure .tag{color:var(--bad);background:rgba(255,98,87,.12)}
-  .ev .txt{min-width:0;overflow-wrap:anywhere;color:var(--muted);white-space:pre-wrap;}
+  .ev .txt{min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .ev.thinking .txt{color:#a596c7;font-style:italic}
   .ev.text .txt{color:var(--ink)}
   .ev .tool{font-family:var(--mono);color:var(--busy);font-weight:700;}
@@ -259,6 +259,7 @@
   var open={};          // task id -> true
   var openKnown={};     // memory id -> true
   var details={};       // task id -> detail payload
+  var evCache={};       // task id -> {seq: event}
   var streams={};       // task id -> EventSource
   var tab='incoming';
 
@@ -365,7 +366,7 @@
       '<span class="pill '+pillClass(t)+'">'+esc(pillText(t))+'</span>';
     if(head.getAttribute('data-h')!==html){head.innerHTML=html;head.setAttribute('data-h',html)}
     head.onclick=function(){toggle(id)};
-    if(open[id])renderDrawer(el.lastChild,t);
+    if(open[id])syncDrawer(el.lastChild,t);
   }
 
   function toggle(id){
@@ -388,10 +389,34 @@
       if(!r.ok)throw new Error('not found');return r.json();
     }).then(function(d){
       details[id]=d;
+      cacheEvents(id,d.events);
       var el=document.querySelector('[data-k="'+id+'"]');
       var t=state.tasks.filter(function(x){return x.task_id===id})[0];
-      if(el&&open[id]&&t)renderDrawer(el.lastChild,t);
+      if(el&&open[id]&&t)syncDrawer(el.lastChild,t);
     }).catch(function(){});
+  }
+
+  function evKey(t,d){
+    return [t.phase,t.outcome,t.pr_url,t.error,(d.analysis||'').length,(d.summary||'').length].join('|');
+  }
+
+  // Only rebuild the drawer when something structural changed. The 1s timer
+  // re-renders the whole list for the age counters, and a blind rebuild here
+  // destroyed the transcript and snapped it to the bottom every second.
+  function syncDrawer(host,t){
+    var d=details[t.task_id]||{},sig=evKey(t,d);
+    if(host.getAttribute('data-sig')===sig)return;
+    host.setAttribute('data-sig',sig);
+    renderDrawer(host,t);
+  }
+
+  function cacheEvents(id,list){
+    if(!evCache[id])evCache[id]={};
+    (list||[]).forEach(function(e){evCache[id][e.seq]=e});
+  }
+  function cachedEvents(id){
+    var m=evCache[id]||{};
+    return Object.keys(m).map(Number).sort(function(a,b){return a-b}).map(function(k){return m[k]});
   }
 
   function renderDrawer(host,t){
@@ -429,25 +454,61 @@
     html+='<div class="sect"><h3>'+(live?'Live reasoning':'Reasoning transcript')+'</h3>'+
       '<div class="feed" id="feed-'+esc(id)+'"></div></div>';
 
+    var old=$('feed-'+id),keepTop=old?old.scrollTop:null;
+    var wasAtBottom=old?(old.scrollHeight-old.scrollTop-old.clientHeight<40):true;
+
     host.innerHTML=html;
     var feed=$('feed-'+id);
-    var evs=(d.events||[]);
-    if(!evs.length&&!live)feed.innerHTML='<div class="empty" style="padding:14px">no transcript recorded</div>';
+    cacheEvents(id,d.events);
+    var evs=cachedEvents(id);
     evs.forEach(function(e){appendEvent(feed,e)});
-    if(live&&!evs.length)feed.innerHTML='<div class="empty" style="padding:14px"><span class="spin"></span> waiting for the agent…</div>';
-    feed.scrollTop=feed.scrollHeight;
+    if(!feed.children.length){
+      feed.innerHTML=live
+        ? '<div class="empty" style="padding:14px"><span class="spin"></span> waiting for the agent…</div>'
+        : '<div class="empty" style="padding:14px">no transcript recorded</div>';
+    }
+    if(keepTop!==null&&!wasAtBottom)feed.scrollTop=keepTop;
+    else feed.scrollTop=feed.scrollHeight;
+  }
+
+  // The feed answers "what is the agent doing", not "what did it read". Tool
+  // output is dropped, every row is one clipped line, and the result envelope is
+  // suppressed when it just repeats the closing message.
+  var NOISY={tool_result:1};
+
+  // A shell one-liner is not a "task". Drop the chaining and the setup verbs so
+  // the row reads as the action the agent actually took.
+  function actionText(e){
+    var t=(e.text||'').replace(/\s+/g,' ').trim();
+    if(e.kind!=='tool')return t;
+    var parts=t.split(/&&|;/).map(function(x){return x.trim()}).filter(Boolean);
+    for(var i=0;i<parts.length;i++){
+      if(!/^(cd|export|set|echo|then|fi|do|done)\b/.test(parts[i]))return parts[i];
+    }
+    return parts[0]||t;
   }
 
   function appendEvent(feed,e){
     if(!feed)return;
+    if(NOISY[e.kind])return;
+    var full=(e.text||'').replace(/\s+/g,' ').trim();
+    var txt=actionText(e);
+    if(e.kind==='result'){
+      var last=feed.lastElementChild,prev=last?(last.getAttribute('data-txt')||''):'';
+      if(prev&&full.slice(0,80)===prev.slice(0,80))return;
+      if(!txt)txt=full||'run finished';
+    }
+    if(!txt&&!e.tool)return;
     if(feed.querySelector('.empty'))feed.innerHTML='';
     if(feed.querySelector('[data-seq="'+e.seq+'"]'))return;
+
     var row=document.createElement('div');
     row.className='ev '+esc(e.kind);
     row.setAttribute('data-seq',e.seq);
-    var label=e.kind==='tool_result'?'result':e.kind;
-    row.innerHTML='<span class="tag">'+esc(label)+'</span><span class="txt">'+
-      (e.tool?'<span class="tool">'+esc(e.tool)+'</span> ':'')+esc(e.text)+'</span>';
+    row.setAttribute('data-txt',full);
+    row.title=(e.tool?e.tool+' — ':'')+full;
+    row.innerHTML='<span class="tag">'+esc(e.kind)+'</span><span class="txt">'+
+      (e.tool?'<span class="tool">'+esc(e.tool)+'</span> ':'')+esc(txt)+'</span>';
     var atBottom=feed.scrollHeight-feed.scrollTop-feed.clientHeight<40;
     feed.appendChild(row);
     if(atBottom)feed.scrollTop=feed.scrollHeight;
@@ -459,6 +520,7 @@
     es.onmessage=function(m){
       try{
         var e=JSON.parse(m.data);
+        cacheEvents(id,[e]);
         appendEvent($('feed-'+id),e);
       }catch(err){}
     };
