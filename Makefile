@@ -1,7 +1,7 @@
 BIN        := bin
 GOFLAGS    :=
 LDFLAGS    := -s -w
-AGENT_HOST ?= ec2-user@44.251.166.76
+AGENT_HOST ?= ec2-user@44.252.31.22
 AGENT_KEY  ?= $(HOME)/.ssh/abhi-dev02-c7g.pem
 
 .PHONY: all build orchestrator mock-poold test vet tidy run-poold run demo deploy clean
@@ -46,8 +46,10 @@ demo: build
 	  sh -c '$(BIN)/mock-poold -addr :9090 -size 8 & POOLD=$$!; \
 	         trap "kill $$POOLD" EXIT; sleep 1; $(BIN)/orchestrator'
 
-# Build the linux binary and ship it + the unit to the host.
+# Build the linux binary and ship it + the unit + the source tree to the host.
 deploy: orchestrator-linux
+	tar --exclude .git --exclude bin --exclude '*.db' -czf /tmp/perf-agent-src.tgz .
+	scp -i $(AGENT_KEY) /tmp/perf-agent-src.tgz            $(AGENT_HOST):/tmp/perf-agent-src.tgz
 	scp -i $(AGENT_KEY) $(BIN)/orchestrator-linux-arm64 $(AGENT_HOST):/tmp/orchestrator
 	scp -i $(AGENT_KEY) mcp.json                        $(AGENT_HOST):/tmp/mcp.json
 	scp -i $(AGENT_KEY) systemd/orchestrator.service    $(AGENT_HOST):/tmp/orchestrator.service
@@ -55,6 +57,8 @@ deploy: orchestrator-linux
 	  sudo install -o agent -g agent -m0755 /tmp/orchestrator /opt/agent/orchestrator; \
 	  sudo cp /tmp/mcp.json /opt/agent/mcp.json; \
 	  sudo cp /tmp/orchestrator.service /etc/systemd/system/orchestrator.service; \
+	  sudo rm -rf /opt/agent/src && sudo mkdir -p /opt/agent/src && \
+	  sudo tar -xzf /tmp/perf-agent-src.tgz -C /opt/agent/src && sudo chown -R agent:agent /opt/agent/src; \
 	  sudo systemctl daemon-reload && sudo systemctl restart orchestrator && \
 	  sleep 2 && sudo systemctl is-active orchestrator'
 
