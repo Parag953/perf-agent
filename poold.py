@@ -60,6 +60,11 @@ class Poold:
                 d = self.store.dispatch()
                 if d:
                     threading.Thread(target=self._prepare_and_run, args=(d["box"], d["run_id"]), daemon=True).start()
+                elif self.cfg.get("auto_prepare", False):
+                    name = self.store.pick_dirty_idle()
+                    if name:
+                        d = self.store.request_reset(name)
+                        threading.Thread(target=self._prepare_and_run, args=(d["box"], None), daemon=True).start()
             except Exception:
                 log(traceback.format_exc())
 
@@ -183,6 +188,44 @@ class Poold:
         v["last_prepare"] = getattr(self, "last_prepare", {}).get(b["name"])
         return v
 
+    CONTRACT_STATE = {"leased": "allocated", "free": "ready", "quarantined": "degraded",
+                      "dirty": "free", "preparing": "free"}
+
+    def vm_id(self, b: dict) -> str:
+        return f"VM{b['vmid']}"
+
+    def box_by_vm_id(self, vm_id: str):
+        for b in self.store.boxes():
+            if vm_id in (self.vm_id(b), b["name"]):
+                return b
+        return None
+
+    def contract_vm(self, b: dict) -> dict:
+        v = {"vm_id": self.vm_id(b), "name": b["name"], "state": self.CONTRACT_STATE.get(b["state"], b["state"]),
+             "poold_state": b["state"], "host": b.get("ip"),
+             "ssh_target": f"{b['ssh_user']}@{b['ip']}" if b.get("ip") else None,
+             "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(b["since"])) if b.get("since") else None}
+        p = self.progress.get(b["name"])
+        if p and b["state"] == "preparing":
+            v["step"] = p.get("step")
+        if b["state"] == "quarantined":
+            v["error"] = b.get("last_error")
+        return v
+
+    def lease_for_orchestrator(self):
+        name = self.store.pick_ready()
+        if not name:
+            return None
+        ttl = self.cfg.get("lease", {}).get("external_ttl_s", 7200)
+        try:
+            lease_id = self.store.lease_external(name, ttl_s=ttl)
+        except ValueError:
+            return None
+        b = self.store.box(name)
+        log(f"{name}: leased to orchestrator lease={lease_id} host={b['ip']}")
+        return {"vm_id": self.vm_id(b), "host": b["ip"], "ssh_target": f"{b['ssh_user']}@{b['ip']}",
+                "state": "allocated", "lease_id": lease_id, "expires_at": b["expires_at"]}
+
     def run_view(self, run_id):
         return self.store.run(run_id)
 
@@ -218,6 +261,8 @@ def _handler(p: Poold):
             try:
                 if parts == ["status"]:
                     return self._json(200, p.status_view())
+                if parts == ["poold", "status"]:
+                    return self._json(200, {"vms": [p.contract_vm(b) for b in p.store.boxes()]})
                 if parts == ["boxes"]:
                     return self._json(200, [p.box_view(b) for b in p.store.boxes()])
                 if len(parts) == 2 and parts[0] == "boxes":
@@ -271,6 +316,17 @@ def _handler(p: Poold):
             except Exception:
                 return self._json(400, {"error": "bad json"})
             try:
+                if parts == ["poold", "lease"]:
+                    lease = p.lease_for_orchestrator()
+                    return self._json(200, lease) if lease else self._json(409, {"error": "no_capacity"})
+                if parts == ["poold", "release"]:
+                    b = p.box_by_vm_id(str(body.get("vm_id", "")))
+                    if not b:
+                        return self._json(404, {"error": "no_such_vm"})
+                    if not p.store.release(b["name"]):
+                        return self._json(409, {"error": "not_allocated"})
+                    log(f"{b['name']}: released by orchestrator")
+                    return self._json(200, {"ok": True})
                 if parts == ["run"]:
                     if not body.get("task"):
                         return self._json(400, {"error": "task required"})

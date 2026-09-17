@@ -159,3 +159,70 @@ class Api(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrchestratorContract(unittest.TestCase):
+    def setUp(self):
+        self.pve, self.remote = FakePVE(), FakeRemote()
+        self.tmp = __import__("tempfile").mkdtemp()
+        cfg = {
+            "listen": "127.0.0.1:0", "db": ":memory:", "trace_dir": self.tmp, "lan_prefix": "10.0.0.",
+            "auto_prepare": True,
+            "boxes": [{"name": "andro-b", "vmid": 102, "ssh_user": "andro-2", "snapshot": "warm-live"}],
+            "gate": {"passes": 2, "interval_s": 0, "settle_s": 0, "timeout_s": 30, "expect_deploys": 13, "expect_ctx": "andromeda"},
+            "lease": {"default_ttl_s": 600, "heartbeat_grace_s": 90, "external_ttl_s": 7200},
+            "dispatch_interval_s": 0.05, "sweep_interval_s": 0.05,
+        }
+        self.p = Poold(cfg, pve=self.pve, remote=self.remote, gate_cfg=GateConfig(**cfg["gate"]))
+        self.p.start()
+        self.base = f"http://127.0.0.1:{self.p.port}"
+
+    def tearDown(self):
+        self.p.stop()
+
+    def vm(self):
+        return http("GET", f"{self.base}/poold/status")[1]["vms"][0]
+
+    def test_auto_prepare_brings_a_dirty_box_to_ready_without_a_run(self):
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready", 10))
+        self.assertEqual(self.pve.rollbacks, [(102, "warm-live")])
+        self.assertEqual(self.vm()["vm_id"], "VM102")
+
+    def test_lease_returns_host_and_ssh_target_and_marks_allocated(self):
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready", 10))
+        code, body = http("POST", f"{self.base}/poold/lease")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["vm_id"], "VM102")
+        self.assertEqual(body["host"], "10.0.0.38")
+        self.assertEqual(body["ssh_target"], "andro-2@10.0.0.38")
+        self.assertEqual(body["state"], "allocated")
+        self.assertEqual(self.vm()["state"], "allocated")
+
+    def test_lease_with_no_ready_box_is_409_no_capacity(self):
+        self.p.pause_dispatch = True
+        code, body = http("POST", f"{self.base}/poold/lease")
+        self.assertEqual(code, 409)
+        self.assertEqual(body, {"error": "no_capacity"})
+
+    def test_release_returns_ok_then_box_is_re_prepared_to_ready(self):
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready", 10))
+        http("POST", f"{self.base}/poold/lease")
+        code, body = http("POST", f"{self.base}/poold/release", {"vm_id": "VM102"})
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"ok": True})
+        self.assertIn(self.vm()["state"], ("free", "ready"))
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready" and len(self.pve.rollbacks) == 2, 10))
+
+    def test_release_unknown_or_unleased_vm_is_404_or_409(self):
+        self.assertEqual(http("POST", f"{self.base}/poold/release", {"vm_id": "VM999"})[0], 404)
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready", 10))
+        self.assertEqual(http("POST", f"{self.base}/poold/release", {"vm_id": "VM102"})[0], 409)
+
+    def test_status_maps_states_to_the_contract_vocabulary(self):
+        self.assertTrue(wait_for(lambda: self.vm()["state"] == "ready", 10))
+        http("POST", f"{self.base}/poold/lease")
+        v = self.vm()
+        self.assertEqual(v["state"], "allocated")
+        self.assertEqual(v["poold_state"], "leased")
+        http("POST", f"{self.base}/boxes/andro-b/quarantine")
+        self.assertEqual(self.vm()["state"], "degraded")

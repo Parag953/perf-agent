@@ -157,3 +157,50 @@ class Sweeper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExternalLease(unittest.TestCase):
+    def test_lease_ready_box_returns_lease_and_marks_leased(self):
+        s = mk()
+        s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
+        self.assertEqual(s.box("andro-b")["state"], "free")
+        lease = s.lease_external("andro-b", ttl_s=7200, now=1000.0)
+        b = s.box("andro-b")
+        self.assertEqual(b["state"], "leased")
+        self.assertEqual(b["lease_id"], lease)
+        self.assertIsNone(b["run_id"])
+        self.assertEqual(b["expires_at"], 8200.0)
+
+    def test_pick_ready_box_returns_none_when_none_free(self):
+        s = mk()
+        self.assertIsNone(s.pick_ready())
+        s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
+        self.assertEqual(s.pick_ready(), "andro-b")
+
+    def test_external_lease_is_not_swept_for_missing_heartbeats(self):
+        s = mk()
+        s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
+        s.lease_external("andro-b", ttl_s=7200, now=1000.0)
+        self.assertEqual(s.sweep(now=5000.0, heartbeat_grace_s=90), [])
+        self.assertEqual(s.box("andro-b")["state"], "leased")
+        s.sweep(now=9000.0, heartbeat_grace_s=90)
+        self.assertEqual(s.box("andro-b")["state"], "dirty")
+
+    def test_release_marks_dirty_and_clears_lease(self):
+        s = mk()
+        s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
+        s.lease_external("andro-b", ttl_s=7200)
+        self.assertTrue(s.release("andro-b"))
+        b = s.box("andro-b")
+        self.assertEqual(b["state"], "dirty")
+        self.assertIsNone(b["lease_id"])
+
+    def test_release_of_unleased_box_is_false(self):
+        s = mk()
+        self.assertFalse(s.release("andro-b"))
+
+    def test_idle_dirty_box_is_offered_for_auto_prepare(self):
+        s = mk()
+        self.assertEqual(s.pick_dirty_idle(), "andro-b")
+        s.request_reset("andro-b")
+        self.assertIsNone(s.pick_dirty_idle())

@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS boxes(
   name TEXT PRIMARY KEY, vmid INTEGER NOT NULL, ssh_user TEXT NOT NULL, ip TEXT,
   snapshot TEXT NOT NULL, state TEXT NOT NULL, since REAL NOT NULL,
   lease_id TEXT, run_id TEXT, acquired_at REAL, expires_at REAL, last_heartbeat REAL,
-  fail_count INTEGER NOT NULL DEFAULT 0, last_error TEXT
+  fail_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, heartbeat_required INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS runs(
   run_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, state TEXT NOT NULL, box TEXT,
@@ -116,7 +116,7 @@ class Store:
             lease = uuid.uuid4().hex[:12]
             self.db.execute(
                 "UPDATE boxes SET state='leased', since=?, lease_id=?, run_id=?, acquired_at=?, expires_at=?, "
-                "last_heartbeat=?, fail_count=0 WHERE name=?",
+                "last_heartbeat=?, fail_count=0, heartbeat_required=1 WHERE name=?",
                 (now, lease, run_id, now, now + ttl_s, now, name))
             self.db.execute("UPDATE runs SET state='running', started_at=? WHERE run_id=?", (now, run_id))
             return lease
@@ -142,6 +142,35 @@ class Store:
             if r and r["box"]:
                 self.db.execute("UPDATE boxes SET state='dirty', since=?, lease_id=NULL, run_id=NULL WHERE name=? AND run_id=?",
                                 (now, r["box"], run_id))
+
+    def pick_ready(self) -> Optional[str]:
+        r = self.db.execute("SELECT name FROM boxes WHERE state='free' ORDER BY name LIMIT 1").fetchone()
+        return r["name"] if r else None
+
+    def pick_dirty_idle(self) -> Optional[str]:
+        r = self.db.execute("SELECT name FROM boxes WHERE state='dirty' AND run_id IS NULL ORDER BY name LIMIT 1").fetchone()
+        return r["name"] if r else None
+
+    def lease_external(self, name, ttl_s, now=None) -> str:
+        now = time.time() if now is None else now
+        with self._tx():
+            b = self.box(name)
+            if not b or b["state"] != "free":
+                raise ValueError(f"box {name} is not ready")
+            lease = uuid.uuid4().hex[:12]
+            self.db.execute(
+                "UPDATE boxes SET state='leased', since=?, lease_id=?, run_id=NULL, acquired_at=?, expires_at=?, "
+                "last_heartbeat=?, heartbeat_required=0 WHERE name=?",
+                (now, lease, now, now + ttl_s, now, name))
+            return lease
+
+    def release(self, name, now=None) -> bool:
+        now = time.time() if now is None else now
+        with self._tx():
+            cur = self.db.execute(
+                "UPDATE boxes SET state='dirty', since=?, lease_id=NULL, run_id=NULL WHERE name=? AND state='leased'",
+                (now, name))
+            return cur.rowcount == 1
 
     def unquarantine(self, name):
         with self._tx():
@@ -174,7 +203,8 @@ class Store:
         swept = []
         with self._tx():
             rows = self.db.execute(
-                "SELECT name, run_id FROM boxes WHERE state='leased' AND (expires_at < ? OR last_heartbeat < ?)",
+                "SELECT name, run_id FROM boxes WHERE state='leased' AND "
+                "(expires_at < ? OR (heartbeat_required=1 AND last_heartbeat < ?))",
                 (now, now - heartbeat_grace_s)).fetchall()
             for r in rows:
                 self.db.execute("UPDATE boxes SET state='dirty', since=?, lease_id=NULL, run_id=NULL WHERE name=?", (now, r["name"]))
