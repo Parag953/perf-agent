@@ -86,6 +86,17 @@ class Poold:
             kill_task(p)
 
     def _prepare_and_run(self, box_name: str, run_id):
+        try:
+            self._prepare_and_run_inner(box_name, run_id)
+        except Exception as e:
+            log(f"{box_name}: unexpected error in prepare/run: {traceback.format_exc()}")
+            self.progress.pop(box_name, None)
+            try:
+                self.store.prepare_failed(box_name, f"internal: {type(e).__name__}: {e}")
+            except Exception:
+                log(traceback.format_exc())
+
+    def _prepare_and_run_inner(self, box_name: str, run_id):
         b = self.store.box(box_name)
         user, vmid, snap = b["ssh_user"], b["vmid"], b["snapshot"]
         t0 = time.time()

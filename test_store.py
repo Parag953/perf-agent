@@ -204,3 +204,25 @@ class ExternalLease(unittest.TestCase):
         self.assertEqual(s.pick_dirty_idle(), "andro-b")
         s.request_reset("andro-b")
         self.assertIsNone(s.pick_dirty_idle())
+
+
+class Migration(unittest.TestCase):
+    def test_opening_a_db_created_by_the_previous_schema_adds_missing_columns(self):
+        import sqlite3, tempfile, os
+        path = os.path.join(tempfile.mkdtemp(), "old.db")
+        c = sqlite3.connect(path)
+        c.executescript("""
+        CREATE TABLE boxes(name TEXT PRIMARY KEY, vmid INTEGER NOT NULL, ssh_user TEXT NOT NULL, ip TEXT,
+          snapshot TEXT NOT NULL, state TEXT NOT NULL, since REAL NOT NULL, lease_id TEXT, run_id TEXT,
+          acquired_at REAL, expires_at REAL, last_heartbeat REAL, fail_count INTEGER NOT NULL DEFAULT 0, last_error TEXT);
+        CREATE TABLE runs(run_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, state TEXT NOT NULL, box TEXT, task TEXT NOT NULL,
+          owner TEXT, source TEXT, ttl_s INTEGER NOT NULL, callback_url TEXT, reset_on_release INTEGER NOT NULL DEFAULT 0,
+          created_at REAL NOT NULL, started_at REAL, ended_at REAL, exit_code INTEGER, error TEXT, branch TEXT);
+        INSERT INTO boxes(name,vmid,ssh_user,snapshot,state,since) VALUES('andro-b',102,'andro-2','warm-live','dirty',0);
+        """)
+        c.commit(); c.close()
+        s = Store(path)
+        s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
+        s.lease_external("andro-b", ttl_s=10)
+        self.assertEqual(s.box("andro-b")["heartbeat_required"], 0)
+        self.assertEqual(s.sweep(now=1e12), [])

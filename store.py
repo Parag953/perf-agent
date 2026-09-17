@@ -29,6 +29,15 @@ class Store:
         self.lock = threading.RLock()
         with self.lock:
             self.db.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self):
+        want = {"boxes": {"heartbeat_required": "INTEGER NOT NULL DEFAULT 1"}}
+        for table, cols in want.items():
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for col, decl in cols.items():
+                if col not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     def _tx(self):
         return _Tx(self)
