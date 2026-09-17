@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Orchestrator — Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="top-in">
+    <div class="brand"><div class="glyph">&#9671;</div><h1>Agent Orchestrator</h1></div>
+    <span class="pill" id="connPill">connecting&hellip;</span>
+    <span class="pill">poold: mocked</span>
+    <button class="toggle" id="themeBtn" aria-label="Toggle theme">&#9680; theme</button>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="tiles">
+    <div class="tile"><div class="tv busy" id="tvAlloc">&ndash;</div><div class="tl">VMs allocated</div></div>
+    <div class="tile"><div class="tv good" id="tvReady">&ndash;</div><div class="tl">VMs ready</div></div>
+    <div class="tile"><div class="tv warn" id="tvQueue">&ndash;</div><div class="tl">queue depth</div></div>
+    <div class="tile"><div class="tv" id="tvHit">&ndash;</div><div class="tl">memory hit rate</div></div>
+    <div class="tile"><div class="tv" id="tvTotal">&ndash;</div><div class="tl">tasks total</div></div>
+    <div class="tile"><div class="tv" id="tvAvg">&ndash;</div><div class="tl">avg task time</div></div>
+  </div>
+
+  <div class="dash-row">
+    <div class="panelbox">
+      <div class="ph">VM pool <span id="vmTotal">8 total</span></div>
+      <div class="vmgrid" id="vmGrid"></div>
+    </div>
+
+    <div class="panelbox">
+      <div class="ph">Tasks <span id="taskSummary">&ndash;</span></div>
+      <div class="tasklist" id="taskList"></div>
+
+      <div class="ph" style="margin-top:16px;">Known issues <span>memory &middot; click a row</span></div>
+      <div id="memList"></div>
+    </div>
+  </div>
+
+  <footer>
+    <span>Agent Orchestrator dashboard &middot; consumes <code>/api/state</code> + <code>/api/stream</code> only</span>
+    <span class="mono" id="lastUpdate">&ndash;</span>
+  </footer>
+
+</div>
+
+<div class="modal-backdrop" id="modalBackdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h3 id="modalTitle">&ndash;</h3>
+      <button class="modal-close" id="modalClose" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>
