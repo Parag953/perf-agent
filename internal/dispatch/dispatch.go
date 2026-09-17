@@ -4,14 +4,15 @@
 package dispatch
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Parag953/perf-agent/internal/config"
 	"github.com/Parag953/perf-agent/internal/model"
@@ -20,14 +21,14 @@ import (
 // Dispatcher runs the investigation prompt against a VM and returns the agent's
 // analysis text (its stdout `result`).
 type Dispatcher interface {
-	Run(ctx context.Context, sshTarget, prompt string) (string, error)
+	Run(ctx context.Context, sshTarget, prompt string, emit func(model.AgentEvent)) (string, error)
 	Mode() string
 }
 
 // New selects a dispatcher from config: "ssh" or "mock".
 func New(cfg config.Config) Dispatcher {
 	if cfg.DispatchMode == "mock" {
-		return mockDispatcher{}
+		return mockDispatcher{delay: cfg.MockStepDelay}
 	}
 	// Read the mcp.json to ship to the VM from the box's local filesystem. The
 	// snapshot the pool VMs boot from has no mcp.json, so the orchestrator writes
@@ -73,7 +74,10 @@ type sshDispatcher struct {
 
 func (d sshDispatcher) Mode() string { return "ssh" }
 
-func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (string, error) {
+func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string, emit func(model.AgentEvent)) (string, error) {
+	if emit == nil {
+		emit = func(model.AgentEvent) {}
+	}
 	if sshTarget == "" {
 		return "", fmt.Errorf("ssh dispatch: empty ssh target")
 	}
@@ -81,7 +85,8 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 	// 1. Provision the (blank) VM: install claude/gh if missing and drop the
 	//    secrets file. Idempotent — a pre-baked image makes this a fast no-op.
 	if d.bootstrap {
-		if err := d.doBootstrap(ctx, sshTarget); err != nil {
+		emit(model.AgentEvent{Kind: model.EventBootstrap, Text: "provisioning " + sshTarget})
+		if err := d.doBootstrap(ctx, sshTarget, emit); err != nil {
 			return "", err
 		}
 	}
@@ -96,30 +101,57 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 		mcpArg = remoteMCPPath // bootstrap wrote it here; already double-quoted
 	}
 	remote := fmt.Sprintf(
-		`set -a; [ -f %s ] && . %s; set +a; export PATH="$HOME/.local/bin:$PATH"; %s -p --output-format json --mcp-config %s --allowedTools %s`,
+		`set -a; [ -f %s ] && . %s; set +a; export PATH="$HOME/.local/bin:$PATH"; %s -p --output-format stream-json --verbose --mcp-config %s --allowedTools %s`,
 		remoteCredsPath, remoteCredsPath, d.claudeBin, mcpArg, shellQuote(d.allowedTools))
 
-	stdout, stderr, err := d.runSSH(ctx, sshTarget, remote, prompt)
+	final, stderr, err := d.runSSHStreaming(ctx, sshTarget, remote, prompt, emit)
 	if err != nil {
 		return "", fmt.Errorf("ssh dispatch: %v: %s", err, strings.TrimSpace(stderr))
 	}
-	return parseClaudeJSON([]byte(stdout)), nil
+	if final == "" {
+		return "", fmt.Errorf("ssh dispatch: agent produced no result: %s", strings.TrimSpace(stderr))
+	}
+	return final, nil
+}
+
+func (d sshDispatcher) runSSHStreaming(ctx context.Context, sshTarget, remote, stdin string, emit func(model.AgentEvent)) (string, string, error) {
+	cmd := exec.CommandContext(ctx, "ssh", d.sshArgs(sshTarget, remote)...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", stderr.String(), err
+	}
+	final, scanErr := scanStream(pipe, emit)
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		return final, stderr.String(), waitErr
+	}
+	return final, stderr.String(), scanErr
+}
+
+func (d sshDispatcher) sshArgs(sshTarget, remote string) []string {
+	args := []string{}
+	if d.key != "" {
+		args = append(args, "-i", d.key)
+	}
+	return append(args,
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ServerAliveInterval=30",
+		sshTarget, remote,
+	)
 }
 
 // runSSH executes one remote command over ssh, piping stdin to it, and returns
 // its stdout/stderr. stdin carries either the bootstrap script or the prompt —
 // never a secret in argv (secrets travel in the bootstrap script's stdin).
 func (d sshDispatcher) runSSH(ctx context.Context, sshTarget, remote, stdin string) (string, string, error) {
-	args := []string{}
-	if d.key != "" {
-		args = append(args, "-i", d.key)
-	}
-	args = append(args,
-		"-o", "BatchMode=yes",
-		"-o", "StrictHostKeyChecking=accept-new",
-		sshTarget, remote,
-	)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd := exec.CommandContext(ctx, "ssh", d.sshArgs(sshTarget, remote)...)
 	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -129,13 +161,32 @@ func (d sshDispatcher) runSSH(ctx context.Context, sshTarget, remote, stdin stri
 
 // doBootstrap ships the provisioning script to the VM over ssh stdin (so the
 // secrets it carries never appear in argv or the process list).
-func (d sshDispatcher) doBootstrap(ctx context.Context, sshTarget string) error {
-	stdout, stderr, err := d.runSSH(ctx, sshTarget, "bash -s", d.bootstrapScript())
+func (d sshDispatcher) doBootstrap(ctx context.Context, sshTarget string, emit func(model.AgentEvent)) error {
+	var seen bytes.Buffer
+	cmd := exec.CommandContext(ctx, "ssh", d.sshArgs(sshTarget, "bash -s")...)
+	cmd.Stdin = strings.NewReader(d.bootstrapScript())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	pipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("ssh bootstrap: %v: %s", err, strings.TrimSpace(stderr))
+		return err
 	}
-	if !strings.Contains(stdout, "BOOTSTRAP_OK") {
-		return fmt.Errorf("ssh bootstrap: incomplete: %s", strings.TrimSpace(stderr))
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("ssh bootstrap: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	sc := bufio.NewScanner(pipe)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		seen.WriteString(line + "\n")
+		if step, ok := strings.CutPrefix(line, "STEP: "); ok {
+			emit(model.AgentEvent{Kind: model.EventBootstrap, Text: step})
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("ssh bootstrap: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	if !strings.Contains(seen.String(), "BOOTSTRAP_OK") {
+		return fmt.Errorf("ssh bootstrap: incomplete: %s", strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }
@@ -169,20 +220,21 @@ chmod 600 "$HOME/.config/agent/mcp.json"
 
 	return fmt.Sprintf(`set -e
 export PATH="$HOME/.local/bin:$PATH"
+say(){ echo "STEP: $1"; }
 
-# 1. secrets -> a 0600 env file the investigation run sources
+say "writing credentials"
 mkdir -p "$HOME/.config/agent"
 umask 077
 cat > "$HOME/.config/agent/env" <<'AGENT_ENV_EOF'
 %sAGENT_ENV_EOF
 chmod 600 "$HOME/.config/agent/env"
 %s
-# 2. claude CLI (idempotent)
+say "checking claude CLI"
 if ! command -v claude >/dev/null 2>&1; then
   curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || true
 fi
 
-# 3. gh CLI: package manager first, then a pinned tarball into ~/.local/bin
+say "checking gh CLI"
 if ! command -v gh >/dev/null 2>&1; then
   (sudo -n dnf install -y gh || sudo -n yum install -y gh || sudo -n bash -c 'apt-get update && apt-get install -y gh') >/dev/null 2>&1 || true
 fi
@@ -196,7 +248,7 @@ if ! command -v gh >/dev/null 2>&1; then
   rm -rf "$tmp"
 fi
 
-# 4. aws CLI v2 (snapshot lacks it) -> ~/.local/bin, no sudo for aws itself
+say "checking aws CLI"
 if ! command -v aws >/dev/null 2>&1; then
   arch=$(uname -m)
   tmp=$(mktemp -d)
@@ -207,7 +259,7 @@ if ! command -v aws >/dev/null 2>&1; then
   rm -rf "$tmp"
 fi
 
-# 5. let gh serve as git's credential helper for the push (needs GH_TOKEN)
+say "wiring git credentials"
 set -a; . "$HOME/.config/agent/env" 2>/dev/null; set +a
 command -v gh >/dev/null 2>&1 && gh auth setup-git >/dev/null 2>&1 || true
 
@@ -237,29 +289,39 @@ func secretEnv(cfg config.Config) map[string]string {
 	return m
 }
 
-// parseClaudeJSON pulls `.result` out of `claude --output-format json`, falling
-// back to raw stdout if it isn't the expected envelope.
-func parseClaudeJSON(b []byte) string {
-	var out struct {
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(b, &out); err == nil && out.Result != "" {
-		return out.Result
-	}
-	return strings.TrimSpace(string(b))
-}
-
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // ---- Mock dispatcher (demo / tests) ----
 
-type mockDispatcher struct{}
+type mockDispatcher struct{ delay time.Duration }
 
 func (mockDispatcher) Mode() string { return "mock" }
 
-func (mockDispatcher) Run(_ context.Context, _, prompt string) (string, error) {
+func (d mockDispatcher) Run(ctx context.Context, _, prompt string, emit func(model.AgentEvent)) (string, error) {
+	if emit != nil {
+		for i, e := range []model.AgentEvent{
+			{Kind: model.EventBootstrap, Text: "provisioning VM"},
+			{Kind: model.EventSystem, Text: "agent session started on claude-opus-5"},
+			{Kind: model.EventThinking, Text: "The alert points at heap growth, so I will look at allocation sites first."},
+			{Kind: model.EventTool, Tool: "Bash", Text: "rg -n 'cache' services/tachyon"},
+			{Kind: model.EventToolResult, Text: "services/tachyon/resources.go:88: cache := buildCache()"},
+			{Kind: model.EventText, Text: "The cache is rebuilt per request. Memoizing it for the request lifetime fixes the churn."},
+			{Kind: model.EventResult, Text: "analysis complete"},
+		} {
+			e.Seq = i + 1
+			e.At = time.Now().UTC()
+			emit(e)
+			if d.delay > 0 {
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(d.delay):
+				}
+			}
+		}
+	}
 	// Return a plausible, self-consistent analysis so the full pipeline
 	// (collect → pr_check → distill → memory) can be exercised without a VM.
 	return "Root cause: the resources cache is rebuilt on every request instead of " +

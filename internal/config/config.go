@@ -60,8 +60,16 @@ type Config struct {
 	// Memory
 	DBPath string
 
-	// Concurrency — number of workers; each holds at most one leased VM.
+	// Concurrency — number of concurrent memory lookups; VM work is bounded by
+	// the pool itself, since one scheduler owns every lease.
 	Workers int
+
+	// MockStepDelay paces the mock dispatcher so a demo run is watchable.
+	MockStepDelay time.Duration
+
+	// QueuePoll is how often the scheduler retries a lease for the queue head
+	// while the pool is exhausted.
+	QueuePoll time.Duration
 }
 
 func Load() Config {
@@ -95,6 +103,8 @@ func Load() Config {
 		ClaudeTimeout: time.Duration(envInt("CLAUDE_TIMEOUT", 900)) * time.Second,
 		DBPath:        env("DB_PATH", "/opt/agent/memory.db"),
 		Workers:       envInt("WORKERS", 4),
+		QueuePoll:     time.Duration(envInt("QUEUE_POLL_SECS", 5)) * time.Second,
+		MockStepDelay: time.Duration(envInt("MOCK_STEP_DELAY_MS", 1500)) * time.Millisecond,
 	}
 	return c
 }

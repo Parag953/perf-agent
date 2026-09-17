@@ -14,7 +14,7 @@ small read-only JSON contract.
 
 ```
 trigger ─▶ [haiku] signature ─▶ memory lookup ─┬─ hit  ─▶ return stored analysis + PR   (no VM)
-                                               └─ miss ─▶ poold.lease() ─▶ ssh claude -p ─▶
+                                               └─ miss ─▶ QUEUE ─▶ scheduler leases ─▶ ssh claude -p ─▶
                                                           collect ─▶ PR check ─▶ [haiku] distill ─▶
                                                           memory.insert ─▶ poold.release()
 ```
@@ -22,18 +22,40 @@ trigger ─▶ [haiku] signature ─▶ memory lookup ─┬─ hit  ─▶ retu
 One task per VM, no retry. A VM is `ready`/`free` → `allocated` (on lease) →
 `degraded` (after its one task) → Poold recycles it → `ready`.
 
+### The queue
+
+Fingerprinting and the memory lookup run **off the queue**, so a known issue never
+waits for a VM. On a miss the task joins a FIFO queue ordered by submission, and a
+**single scheduler goroutine** — the only thing that calls `Lease` — serves the head.
+When the pool is exhausted Poold answers `409 no_capacity`; the task simply stays
+queued (with a visible `queue_pos`) and the scheduler retries every `QUEUE_POLL_SECS`
+and immediately whenever a VM is released. An exhausted pool is never an error.
+
+Because Poold resets a box on release, freeing a VM takes minutes. `/api/state`
+surfaces that as `vms[].prepare` (`step`, `elapsed_s`) plus the gate sample, read
+from Poold's `GET /boxes`, so a queue wait is explained rather than silent.
+
+### Live agent transcripts
+
+The dispatcher runs `claude -p --output-format stream-json --verbose` and parses the
+NDJSON as it arrives, turning it into typed events — `thinking`, `text`, `tool`,
+`tool_result`, `bootstrap`, `system`, `result`, `failure`. Each is appended to
+SQLite and fanned out to subscribers, so the dashboard can watch a run in flight and
+replay it in full afterwards. Bootstrap emits its own progress, so VM provisioning
+is not dead air either.
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `cmd/orchestrator` | the service — webhook intake, workers, dashboard API |
+| `cmd/orchestrator` | the service — webhook intake, scheduler, dashboard API |
 | `cmd/mock-poold` | stand-in pool manager (real Poold API is mocked for now) |
 | `internal/orchestrator` | core loop, task registry, phase transitions, snapshot |
-| `internal/store` | SQLite memory store (pure-Go driver, no cgo) |
+| `internal/store` | SQLite: memory rows, tasks, and agent transcripts (pure-Go driver, no cgo) |
 | `internal/llm` | Haiku signature / match / distill — `api`, `cli`, `stub` backends |
 | `internal/poold` | pool-manager client (`Lease`/`Release`/`Status`) |
-| `internal/dispatch` | SSH the `claude -p` job to a VM; the investigation prompt; output parsing |
-| `internal/api` | `/webhook`, `/api/state`, `/api/stream` (SSE), `/api/memory/:id`, embedded reference dashboard |
+| `internal/dispatch` | SSH the `claude -p` job to a VM; the investigation prompt; stream-json parsing |
+| `internal/api` | `/webhook`, `/api/state`, `/api/stream`, `/api/task/:id`, `/api/task/:id/stream`, `/api/memory/:id`, embedded dashboard |
 
 ## Run it locally (no external dependencies)
 
@@ -62,25 +84,32 @@ Read-only. The dashboard needs nothing but these.
 | `GET /api/state` | one snapshot: `stats`, `vms`, `tasks`, `memory` (see below) |
 | `GET /api/stream` | SSE — the same `state` JSON on every change; falls back to polling `/api/state` |
 | `GET /api/memory/:id` | one full memory row incl. `full_analysis` (drill-down) |
+| `GET /api/task/:id` | one task incl. its trigger `payload`, full `analysis`, `summary` and the whole `events` transcript |
+| `GET /api/task/:id/stream` | SSE — one `AgentEvent` per frame, live, for a task in flight |
 
 `/api/state` shape:
 
 ```jsonc
 {
   "stats":  { "vms_total":8, "vms_ready":3, "vms_allocated":4, "vms_degraded":1,
-              "queue_depth":2, "tasks_total":147, "cache_hits":58,
-              "hit_rate":0.39, "avg_task_secs":472 },
-  "vms":    [ { "vm_id":"VM101", "state":"allocated", "host":"…", "task_id":"t-9a1", "since":"…" } ],
+              "queue_depth":2, "running":4, "completed":143, "tasks_total":147,
+              "cache_hits":58, "hit_rate":0.39, "avg_task_secs":472 },
+  "vms":    [ { "vm_id":"VM101", "name":"andro-a", "state":"allocated", "host":"…",
+               "task_id":"t-9a1", "service":"tachyon", "alert":"memory > 40%", "since":"…" },
+              { "vm_id":"VM102", "name":"andro-b", "state":"degraded", "degraded_reason":"preparing",
+               "prepare":{ "step":"gate", "attempt":1, "elapsed_s":118.4,
+                           "gate_sample":"deploys=13 pods_not_ready=0 restarts=0" } } ],
   "tasks":  [ { "task_id":"t-9a1", "service":"tachyon", "alert":"memory > 40%",
                "phase":"running", "vm_id":"VM101", "outcome":"", "pr_url":"",
-               "enqueued_at":"…", "started_at":"…" } ],
+               "queue_pos":0, "enqueued_at":"…", "started_at":"…" } ],
   "memory": [ { "id":12, "signature":"tachyon/scope-map-churn", "service":"tachyon",
                "root_cause":"…", "pr_url":"…", "hit_count":6, "last_seen":"…" } ]
 }
 ```
 
-**Task `phase`**: `queued → matching →` (`done`/memory hit) or
-`leasing → dispatched → running → collecting → pr_check → distilling → done`.
+**Task `phase`**: `matching →` (`done`/memory hit) or
+`queued → dispatched → running → collecting → pr_check → distilling → done`.
+A task in `queued` carries `queue_pos` (1 = next to be served).
 A finished task also carries an **`outcome`**: `pr_opened` (with `pr_url`),
 `analysis_only`, `memory_hit`, `need_queries`, or `error`.
 
@@ -89,8 +118,12 @@ A finished task also carries an **`outcome`**: `pr_opened` (with `pr_url`),
 ## Configuration
 
 Everything is env-driven; see [`.env.example`](.env.example). Key knobs:
-`POOLD_URL`, `WORKERS`, `DB_PATH`, `DISPATCH_MODE` (`ssh`|`mock`),
-`LLM_BACKEND` (`api`|`cli`|`stub`), `ANTHROPIC_API_KEY`, `CLAUDE_TIMEOUT`.
+`POOLD_URL`, `WORKERS`, `QUEUE_POLL_SECS`, `DB_PATH`, `DISPATCH_MODE` (`ssh`|`mock`),
+`LLM_BACKEND` (`api`|`cli`|`stub`), `ANTHROPIC_API_KEY`, `CLAUDE_TIMEOUT`,
+`MOCK_STEP_DELAY_MS` (paces the mock dispatcher for demos).
+
+`WORKERS` now bounds only concurrent *memory lookups*; how many investigations run
+at once is bounded by the pool itself, since one scheduler owns every lease.
 
 The **LLM backend** the orchestrator uses for its own Haiku calls:
 `api` (Anthropic key), `cli` (shells out to the local `claude`, reusing the
@@ -134,5 +167,12 @@ checkout, kubectl and the local k8s cluster. Mint the Claude token with
   contract, so the real service drops in unchanged.
 - **`need_queries`** (agent pausing for DB data) currently parks the task; the
   human-in-the-loop resume is future work.
-- **Task state** lives in memory (the SQLite store holds *memory rows*, not the
-  queue) — a restart drops in-flight tasks. Persisting them is a known follow-up.
+- **`claude` session limits** are shared between the orchestrator's own Haiku calls
+  (`LLM_BACKEND=cli`) and the agent runs on the VMs, because both use the same
+  subscription token. Hitting the cap shows up as `signature failed` and
+  `ssh dispatch: exit status 1`.
+
+Task state is no longer in-memory only: tasks, their trigger payloads, their
+analyses and their full transcripts persist to SQLite. On startup the orchestrator
+restores them, fails anything left mid-flight, and **releases the VM it was
+holding** — previously a restart stranded that VM as `allocated` forever.
