@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-HOST=${1:-andro-1@10.0.0.155}
+HOST=${1:-andro-3@10.0.0.192}
 cd "$(dirname "$0")"
 python3 -m unittest discover -p 'test_*.py' >/dev/null
 tar --exclude pool.db --exclude traces --exclude .git --exclude __pycache__ -cf - . | ssh "$HOST" 'mkdir -p ~/poold && tar -xf - -C ~/poold'

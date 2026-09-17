@@ -1,6 +1,6 @@
 listen = "0.0.0.0:7070"
-db = "/home/andro-1/poold/pool.db"
-trace_dir = "/home/andro-1/poold/traces"
+db = "/home/andro-3/poold/pool.db"
+trace_dir = "/home/andro-3/poold/traces"
 lan_prefix = "10.0.0."
 dispatch_interval_s = 2.0
 sweep_interval_s = 30.0
@@ -24,6 +24,13 @@ expect_ctx = "andromeda"
 default_ttl_s = 3600
 heartbeat_grace_s = 90
 external_ttl_s = 7200
+
+[[boxes]]
+name = "andro-a"
+vmid = 101
+ssh_user = "andro-1"
+ip = "10.0.0.155"
+snapshot = "warm-live-2"
 
 [[boxes]]
 name = "andro-b"
