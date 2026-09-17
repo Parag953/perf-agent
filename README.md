@@ -102,8 +102,26 @@ subscription OAuth token), or `stub` (dependency-free, for demos/tests).
 make deploy      # cross-compiles linux/arm64, ships binary + unit, restarts service
 ```
 
-Host needs `/opt/agent/.env` (root-owned 0600), and for `ssh` dispatch the VMs
-must have `claude`, `gh`, `aws`, `go`, and the voyager checkout provisioned by Poold.
+Host needs `/opt/agent/.env` (root-owned 0600). A leased VM comes back blank.
+
+## VM bootstrap (provisioning at dispatch)
+
+Before each `claude -p` run the SSH dispatcher **provisions the leased VM** so the
+agent can actually do its job (`internal/dispatch/dispatch.go`, `VM_BOOTSTRAP=true`):
+
+1. **Secrets** — writes `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`/`GITHUB_TOKEN`, and
+   `AWS_*` from the box's `/opt/agent/.env` to `~/.config/agent/env` on the VM
+   (chmod 600). Travels over the ssh *stdin*, never argv, so it isn't in `ps`. The
+   investigation run then `source`s that file so `claude`, `gh`, and `aws` are
+   authenticated.
+2. **`claude`** — `command -v claude || curl -fsSL https://claude.ai/install.sh | bash`.
+3. **`gh`** — package manager, then a pinned tarball (`GH_VERSION`) into
+   `~/.local/bin`; then `gh auth setup-git` so `git push` and `gh pr create` both work.
+
+Every step is guarded by `command -v`, so a **pre-baked golden image no-ops** (only
+the secrets file is rewritten) — bootstrap is a self-healing safety net, not a
+per-task installer. `go`, `aws`, and the voyager checkout are expected on the image;
+mint the Claude token with `claude setup-token`.
 
 ## Not built yet (intentionally mocked / deferred)
 
