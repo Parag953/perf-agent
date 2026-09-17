@@ -1,57 +1,115 @@
-# perf-agent
+# perf-agent — Agent Orchestrator
 
-Autonomous performance-triage agent. A Datadog alert fires → the agent investigates
-the affected Voyager service like a developer (pprof profiles from S3, source code,
-Datadog metrics), asks a human for DB query results via Slack when needed, and opens
-a **draft PR** if it lands on a concrete fix.
+Performance-triage orchestrator, in Go. A trigger arrives, a cheap model
+fingerprints the issue and checks **memory**; on a miss the orchestrator
+**leases a VM** from the pool manager (Poold), **SSHes a `claude -p`** investigation
+onto it, distills the result back into memory, and returns the VM. The agent opens
+a **draft PR** when it lands a fix. A dashboard watches the whole thing over a
+small read-only JSON contract.
 
-## Architecture
+> This replaces the previous single-box Python service (`app.py`). Design doc:
+> the orchestrator artifact (VM leasing, memory, dashboard contract).
+
+## Flow
 
 ```
-Datadog monitor (@webhook-perf-agent)
-        │  POST /webhook  (:8080)
-        ▼
-   app.py  (systemd service `agent`, runs as user `agent`)
-        │  spawns:  claude -p  (headless, subscription OAuth)
-        ▼
-   Claude investigates — fetches pprof from S3 only if needed, reads
-   /opt/agent/voyager source, queries Datadog via MCP
-        │
-   ┌────┴─────────────────────────┐
-   │ needs DB data                │ has a fix
-   ▼                              ▼
- posts SQL/Cypher to Slack     opens draft PR, posts link to Slack
- thread, pauses                 (human reviews)
-   │
- human replies in thread → claude --resume → completes
+trigger ─▶ [haiku] signature ─▶ memory lookup ─┬─ hit  ─▶ return stored analysis + PR   (no VM)
+                                               └─ miss ─▶ poold.lease() ─▶ ssh claude -p ─▶
+                                                          collect ─▶ PR check ─▶ [haiku] distill ─▶
+                                                          memory.insert ─▶ poold.release()
 ```
 
-## Host layout (EC2, Amazon Linux 2023)
+One task per VM, no retry. A VM is `ready`/`free` → `allocated` (on lease) →
+`degraded` (after its one task) → Poold recycles it → `ready`.
+
+## Layout
 
 | Path | What |
 |---|---|
-| `/opt/agent/app.py` | the service (this repo's `app.py`) |
-| `/opt/agent/.env` | secrets, root-owned 0600 — **never committed** (see `.env.example`) |
-| `/opt/agent/mcp.json` | Datadog MCP config (`${DD_API_KEY}` placeholders) |
-| `/opt/agent/venv` | Python venv (`flask`, `slack_bolt`, `boto3`) |
-| `/opt/agent/voyager` | shallow clone of `andromedasec/voyager` (source context) |
-| `/etc/systemd/system/agent.service` | the unit (this repo's `systemd/agent.service`) |
+| `cmd/orchestrator` | the service — webhook intake, workers, dashboard API |
+| `cmd/mock-poold` | stand-in pool manager (real Poold API is mocked for now) |
+| `internal/orchestrator` | core loop, task registry, phase transitions, snapshot |
+| `internal/store` | SQLite memory store (pure-Go driver, no cgo) |
+| `internal/llm` | Haiku signature / match / distill — `api`, `cli`, `stub` backends |
+| `internal/poold` | pool-manager client (`Lease`/`Release`/`Status`) |
+| `internal/dispatch` | SSH the `claude -p` job to a VM; the investigation prompt; output parsing |
+| `internal/api` | `/webhook`, `/api/state`, `/api/stream` (SSE), `/api/memory/:id`, embedded reference dashboard |
 
-Runtime deps on the host: Node 22 + `claude` on PATH, `gh`, `aws`, `go`, `git`.
-
-## Deploy
+## Run it locally (no external dependencies)
 
 ```bash
-./deploy.sh          # scp app.py + mcp.json + unit, restart, show status
+make demo        # mock-poold + orchestrator with mock dispatch + stub LLM
 ```
 
-Override host/key with `AGENT_HOST` / `AGENT_KEY` env vars.
+Then open <http://localhost:8080> and fire an alert:
 
-## Notes
+```bash
+curl -XPOST localhost:8080/webhook \
+  -d '{"title":"memory > 40%","tags":["kube_deployment:tachyon"]}'
+```
 
-- Slack uses **Socket Mode** (no inbound port). Requires `message.channels` event
-  subscription and the bot invited to the target channel (`C0C1SH00CP9`).
-- Only one process may hold the Slack app token's socket at a time.
-- AWS creds in `.env` are short-lived STS tokens — refresh when they expire
-  (`ExpiredToken` in logs), or attach an instance role.
-- `pending_sessions` is in-memory: a restart drops any paused analyses.
+Fire the same alert twice: the first opens a (mock) PR and writes a memory row;
+the second is served from memory with **no VM spent**. Watch it live on the dashboard.
+
+`make test` runs an end-to-end test (miss → PR → memory, then hit) with fakes.
+
+## Dashboard contract (build against this)
+
+Read-only. The dashboard needs nothing but these.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/state` | one snapshot: `stats`, `vms`, `tasks`, `memory` (see below) |
+| `GET /api/stream` | SSE — the same `state` JSON on every change; falls back to polling `/api/state` |
+| `GET /api/memory/:id` | one full memory row incl. `full_analysis` (drill-down) |
+
+`/api/state` shape:
+
+```jsonc
+{
+  "stats":  { "vms_total":8, "vms_ready":3, "vms_allocated":4, "vms_degraded":1,
+              "queue_depth":2, "tasks_total":147, "cache_hits":58,
+              "hit_rate":0.39, "avg_task_secs":472 },
+  "vms":    [ { "vm_id":"VM101", "state":"allocated", "host":"…", "task_id":"t-9a1", "since":"…" } ],
+  "tasks":  [ { "task_id":"t-9a1", "service":"tachyon", "alert":"memory > 40%",
+               "phase":"running", "vm_id":"VM101", "outcome":"", "pr_url":"",
+               "enqueued_at":"…", "started_at":"…" } ],
+  "memory": [ { "id":12, "signature":"tachyon/scope-map-churn", "service":"tachyon",
+               "root_cause":"…", "pr_url":"…", "hit_count":6, "last_seen":"…" } ]
+}
+```
+
+**Task `phase`**: `queued → matching →` (`done`/memory hit) or
+`leasing → dispatched → running → collecting → pr_check → distilling → done`.
+A finished task also carries an **`outcome`**: `pr_opened` (with `pr_url`),
+`analysis_only`, `memory_hit`, `need_queries`, or `error`.
+
+**VM `state`**: `ready` / `free` (leasable), `allocated`, `degraded`.
+
+## Configuration
+
+Everything is env-driven; see [`.env.example`](.env.example). Key knobs:
+`POOLD_URL`, `WORKERS`, `DB_PATH`, `DISPATCH_MODE` (`ssh`|`mock`),
+`LLM_BACKEND` (`api`|`cli`|`stub`), `ANTHROPIC_API_KEY`, `CLAUDE_TIMEOUT`.
+
+The **LLM backend** the orchestrator uses for its own Haiku calls:
+`api` (Anthropic key), `cli` (shells out to the local `claude`, reusing the
+subscription OAuth token), or `stub` (dependency-free, for demos/tests).
+
+## Deploy (EC2, Amazon Linux 2023, aarch64)
+
+```bash
+make deploy      # cross-compiles linux/arm64, ships binary + unit, restarts service
+```
+
+Host needs `/opt/agent/.env` (root-owned 0600), and for `ssh` dispatch the VMs
+must have `claude`, `gh`, `aws`, `go`, and the voyager checkout provisioned by Poold.
+
+## Not built yet (intentionally mocked / deferred)
+
+- **Poold** is mocked (`cmd/mock-poold`). The client depends only on the HTTP
+  contract, so the real service drops in unchanged.
+- **`need_queries`** (agent pausing for DB data) currently parks the task; the
+  human-in-the-loop resume is future work.
+- **Task state** lives in memory (the SQLite store holds *memory rows*, not the
+  queue) — a restart drops in-flight tasks. Persisting them is a known follow-up.

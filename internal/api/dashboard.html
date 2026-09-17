@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Orchestrator</title>
+<style>
+  :root{
+    --ground:#0d1219;--surface:#141b25;--surface2:#1b2431;--ink:#e6ecf4;--muted:#9aa5b5;
+    --faint:#69748a;--border:#27323f;--accent:#7f8ff6;--ok:#48c565;--warn:#e6a23c;--idle:#69748a;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);
+    font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;}
+  .wrap{max-width:1080px;margin:0 auto;padding:20px 16px 60px;}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:6px;}
+  .glyph{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4457c7,var(--accent));
+    display:grid;place-items:center;color:#fff;font-family:var(--mono);font-weight:600;}
+  h1{font-size:17px;margin:0;font-weight:600;}
+  .sub{color:var(--faint);font-size:12px;margin:0 0 18px;font-family:var(--mono);}
+  .dot-live{width:8px;height:8px;border-radius:50%;background:var(--idle);display:inline-block;margin-right:5px;}
+  .dot-live.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 25%,transparent);}
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:13px;}
+  .tv{font-family:var(--mono);font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1;}
+  .tl{font-size:11px;color:var(--muted);margin-top:6px;}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:15px;}
+  .ph{font-size:12px;font-weight:600;margin-bottom:12px;display:flex;justify-content:space-between;}
+  .ph span{font-family:var(--mono);color:var(--faint);font-weight:500;}
+  .vmgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:8px;}
+  .vm{border-radius:8px;padding:9px 4px;text-align:center;font-family:var(--mono);font-size:11px;font-weight:600;border:1px solid var(--border);}
+  .vm .st{display:block;font-size:8.5px;font-weight:500;margin-top:3px;opacity:.85;text-transform:uppercase;}
+  .vm.ready,.vm.free{background:color-mix(in srgb,var(--ok) 14%,var(--surface));border-color:color-mix(in srgb,var(--ok) 38%,var(--border));color:var(--ok);}
+  .vm.allocated{background:color-mix(in srgb,var(--accent) 15%,var(--surface));border-color:color-mix(in srgb,var(--accent) 40%,var(--border));color:var(--accent);}
+  .vm.degraded{background:color-mix(in srgb,var(--warn) 14%,var(--surface));border-color:color-mix(in srgb,var(--warn) 40%,var(--border));color:var(--warn);}
+  .list{display:flex;flex-direction:column;gap:8px;}
+  .task{display:flex;align-items:center;gap:8px;font-size:12px;}
+  .task .svc{font-family:var(--mono);font-weight:600;}
+  .task .al{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;}
+  .task .pr{font-family:var(--mono);font-size:10px;color:var(--accent);text-decoration:none;}
+  .pill{font-family:var(--mono);font-size:9.5px;font-weight:600;text-transform:uppercase;letter-spacing:.03em;padding:2px 8px;border-radius:999px;white-space:nowrap;}
+  .pill.run{background:color-mix(in srgb,var(--accent) 16%,var(--surface));color:var(--accent);}
+  .pill.queue{background:var(--surface2);color:var(--muted);}
+  .pill.hit{background:color-mix(in srgb,var(--ok) 16%,var(--surface));color:var(--ok);}
+  .pill.pr{background:color-mix(in srgb,var(--accent) 18%,var(--surface));color:var(--accent);}
+  .pill.err{background:color-mix(in srgb,#f06d6d 16%,var(--surface));color:#f06d6d;}
+  .pill.done{background:var(--surface2);color:var(--faint);}
+  .mem{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--border);font-size:12px;}
+  .mem:first-child{border-top:none;}
+  .mem .sig{font-family:var(--mono);font-weight:600;}
+  .mem .rc{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;}
+  .mem .hits{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,var(--surface));padding:2px 7px;border-radius:999px;}
+  .empty{color:var(--faint);font-size:12px;font-style:italic;padding:6px 0;}
+  @media (max-width:720px){.tiles{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><div class="glyph">◇</div><h1>Agent Orchestrator</h1></header>
+  <p class="sub"><span class="dot-live" id="live"></span><span id="livetext">connecting…</span> · reference dashboard · consumes /api/state + /api/stream</p>
+
+  <div class="tiles">
+    <div class="tile"><div class="tv" id="s-alloc">–</div><div class="tl">VMs allocated</div></div>
+    <div class="tile"><div class="tv" id="s-ready">–</div><div class="tl">VMs ready</div></div>
+    <div class="tile"><div class="tv" id="s-queue">–</div><div class="tl">queue depth</div></div>
+    <div class="tile"><div class="tv" id="s-hit">–</div><div class="tl">memory hit rate</div></div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <div class="ph">VM pool <span id="vm-total">0 total</span></div>
+      <div class="vmgrid" id="vmgrid"></div>
+      <div class="empty" id="vm-empty" hidden>no VMs reported by poold</div>
+    </div>
+    <div class="panel">
+      <div class="ph">Tasks <span id="task-count">0</span></div>
+      <div class="list" id="tasks"></div>
+      <div class="empty" id="task-empty">no tasks yet — POST an alert to /webhook</div>
+
+      <div class="ph" style="margin-top:16px">Known issues <span>memory</span></div>
+      <div id="memory"></div>
+      <div class="empty" id="mem-empty">memory is empty</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var live=document.getElementById('live'), livetext=document.getElementById('livetext');
+  function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+  function phaseClass(t){
+    if(t.phase==='queued')return 'queue';
+    if(t.phase==='error')return 'err';
+    if(t.phase!=='done')return 'run';
+    if(t.outcome==='memory_hit')return 'hit';
+    if(t.outcome==='pr_opened')return 'pr';
+    return 'done';
+  }
+  function phaseLabel(t){
+    if(t.phase!=='done')return t.phase.replace('_',' ');
+    return (t.outcome||'done').replace('_',' ');
+  }
+  function render(st){
+    var s=st.stats||{};
+    document.getElementById('s-alloc').textContent=s.vms_allocated||0;
+    document.getElementById('s-ready').textContent=s.vms_ready||0;
+    document.getElementById('s-queue').textContent=s.queue_depth||0;
+    document.getElementById('s-hit').textContent=Math.round((s.hit_rate||0)*100)+'%';
+    document.getElementById('vm-total').textContent=(s.vms_total||0)+' total';
+
+    var vms=st.vms||[], g=document.getElementById('vmgrid');
+    document.getElementById('vm-empty').hidden=vms.length>0;
+    g.innerHTML=vms.map(function(v){
+      var id=v.vm_id.replace(/[^0-9]/g,'')||v.vm_id;
+      return '<div class="vm '+esc(v.state)+'"><span>'+esc(id)+'</span><span class="st">'+esc(v.state)+'</span></div>';
+    }).join('');
+
+    var tasks=(st.tasks||[]).slice().reverse();
+    document.getElementById('task-count').textContent=(st.stats&&st.stats.tasks_total)||tasks.length;
+    document.getElementById('task-empty').hidden=tasks.length>0;
+    document.getElementById('tasks').innerHTML=tasks.slice(0,12).map(function(t){
+      var pr=t.pr_url?'<a class="pr" href="'+esc(t.pr_url)+'" target="_blank" rel="noopener">PR ↗</a>':'';
+      return '<div class="task"><span class="svc">'+esc(t.service)+'</span>'+
+        '<span class="al">'+esc(t.alert)+'</span>'+pr+
+        '<span class="pill '+phaseClass(t)+'">'+esc(phaseLabel(t))+'</span></div>';
+    }).join('');
+
+    var mem=st.memory||[];
+    document.getElementById('mem-empty').hidden=mem.length>0;
+    document.getElementById('memory').innerHTML=mem.slice(0,8).map(function(m){
+      return '<div class="mem"><span class="sig">'+esc(m.signature)+'</span>'+
+        '<span class="rc">'+esc(m.root_cause||'')+'</span>'+
+        '<span class="hits">'+(m.hit_count||0)+' hits</span></div>';
+    }).join('');
+  }
+  function connect(){
+    var es=new EventSource('/api/stream');
+    es.onopen=function(){live.className='dot-live on';livetext.textContent='live';};
+    es.onmessage=function(e){try{render(JSON.parse(e.data));}catch(err){}};
+    es.onerror=function(){live.className='dot-live';livetext.textContent='reconnecting…';};
+  }
+  fetch('/api/state').then(function(r){return r.json();}).then(render).catch(function(){});
+  connect();
+})();
+</script>
+</body>
+</html>
