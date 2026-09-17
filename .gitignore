@@ -12,3 +12,9 @@ coverage.*
 .vscode/
 .idea/
 .DS_Store
+
+# pool tooling
+pool/poold/pool.db
+pool/poold/traces/
+pool/**/__pycache__/
+pool/scripts/phase0.log
