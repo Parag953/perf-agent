@@ -41,6 +41,7 @@ type Orchestrator struct {
 	tasks    map[string]*model.Task
 	order    []string // task ids, insertion order
 	seq      int64
+	total    int // cumulative tasks submitted (survives eviction)
 	hits     int
 	durSum   time.Duration
 	durCount int
@@ -75,6 +76,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 func (o *Orchestrator) Submit(t model.Trigger) model.Task {
 	o.mu.Lock()
 	o.seq++
+	o.total++
 	id := fmt.Sprintf("t-%d", o.seq)
 	task := &model.Task{
 		ID:         id,
@@ -285,6 +287,7 @@ func (o *Orchestrator) finish(task *model.Task, outcome model.Outcome, mut func(
 	if mut != nil {
 		mut(task)
 	}
+	o.evictLocked()
 	o.mu.Unlock()
 	o.broadcast()
 }
@@ -297,8 +300,43 @@ func (o *Orchestrator) fail(task *model.Task, err error) {
 	task.Outcome = model.OutcomeError
 	task.Error = err.Error()
 	task.FinishedAt = &fin
+	o.evictLocked()
 	o.mu.Unlock()
 	o.broadcast()
+}
+
+// maxTerminalTasks bounds how many finished (done/error) tasks we retain in the
+// live registry. All in-flight tasks are always kept; the cumulative count is
+// tracked separately in o.total, so stats.tasks_total is unaffected by eviction.
+const maxTerminalTasks = 50
+
+// evictLocked drops the oldest terminal tasks beyond maxTerminalTasks so the
+// registry (and the /api/state payload) can't grow without bound. Caller holds o.mu.
+func (o *Orchestrator) evictLocked() {
+	terminal := 0
+	for _, id := range o.order {
+		if isTerminal(o.tasks[id].Phase) {
+			terminal++
+		}
+	}
+	remove := terminal - maxTerminalTasks
+	if remove <= 0 {
+		return
+	}
+	kept := make([]string, 0, len(o.order)-remove)
+	for _, id := range o.order {
+		if remove > 0 && isTerminal(o.tasks[id].Phase) {
+			delete(o.tasks, id)
+			remove--
+			continue
+		}
+		kept = append(kept, id)
+	}
+	o.order = kept
+}
+
+func isTerminal(p model.Phase) bool {
+	return p == model.PhaseDone || p == model.PhaseError
 }
 
 // ---- poold status polling ----
@@ -332,7 +370,10 @@ func (o *Orchestrator) refreshStatus(ctx context.Context) {
 
 func (o *Orchestrator) Snapshot() model.State {
 	o.vmMu.Lock()
-	vms := append([]model.VM(nil), o.vmSnap...)
+	// Always a non-nil slice: the dashboard contract promises arrays, and a nil
+	// slice would marshal to JSON null and break consumers doing state.vms.map(...).
+	vms := make([]model.VM, 0, len(o.vmSnap))
+	vms = append(vms, o.vmSnap...)
 	o.vmMu.Unlock()
 
 	o.mu.Lock()
@@ -347,7 +388,7 @@ func (o *Orchestrator) Snapshot() model.State {
 	}
 	stats := model.Stats{
 		QueueDepth: queueDepth,
-		TasksTotal: len(o.order),
+		TasksTotal: o.total,
 		CacheHits:  o.hits,
 	}
 	if stats.TasksTotal > 0 {
@@ -373,6 +414,9 @@ func (o *Orchestrator) Snapshot() model.State {
 	mems, err := o.mem.Summaries(100)
 	if err != nil {
 		o.log.Printf("snapshot: memory summaries failed: %v", err)
+	}
+	if mems == nil {
+		mems = []model.MemorySummary{} // never null in the contract
 	}
 
 	return model.State{Stats: stats, VMs: vms, Tasks: tasks, Memory: mems}

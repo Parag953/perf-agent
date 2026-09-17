@@ -16,8 +16,8 @@
   }
 
   function esc(s) {
-    return String(s == null ? "" : s).replace(/[&<>]/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
 
@@ -29,26 +29,34 @@
   }
 
   function render(state) {
-    var s = state.stats;
-    document.getElementById("tvAlloc").textContent = s.vms_allocated;
-    document.getElementById("tvReady").textContent = s.vms_ready;
-    document.getElementById("tvQueue").textContent = s.queue_depth;
-    document.getElementById("tvHit").textContent = Math.round(s.hit_rate * 100) + "%";
-    document.getElementById("tvTotal").textContent = s.tasks_total;
-    document.getElementById("tvAvg").textContent = s.avg_task_secs + "s";
-    document.getElementById("vmTotal").textContent = s.vms_total + " total";
+    if (!state) return;
+    // The contract promises arrays + a stats object, but stay defensive: a real
+    // backend can send null (e.g. before poold status is first fetched), and one
+    // null here would otherwise throw and blank the entire dashboard.
+    var s = state.stats || {};
+    var vms = state.vms || [];
+    var allTasks = state.tasks || [];
+    var memory = state.memory || [];
 
-    document.getElementById("vmGrid").innerHTML = state.vms.map(function (vm) {
+    document.getElementById("tvAlloc").textContent = s.vms_allocated || 0;
+    document.getElementById("tvReady").textContent = s.vms_ready || 0;
+    document.getElementById("tvQueue").textContent = s.queue_depth || 0;
+    document.getElementById("tvHit").textContent = Math.round((s.hit_rate || 0) * 100) + "%";
+    document.getElementById("tvTotal").textContent = s.tasks_total || 0;
+    document.getElementById("tvAvg").textContent = (s.avg_task_secs || 0) + "s";
+    document.getElementById("vmTotal").textContent = (s.vms_total || 0) + " total";
+
+    document.getElementById("vmGrid").innerHTML = vms.map(function (vm) {
       var num = vm.vm_id.replace(/^VM/, "");
       return '<div class="vmchip vm-' + vm.state + '" title="' + esc(vm.host) + (vm.task_id ? " · " + esc(vm.task_id) : "") + '">' +
         '<span class="id">' + num + '</span><span class="stt">' + vm.state.slice(0, 5) + '</span></div>';
     }).join("");
 
-    var running = state.tasks.filter(function (t) { return t.phase !== "queued" && t.phase !== "done"; }).length;
-    document.getElementById("taskSummary").textContent = s.queue_depth + " queued · " + running + " active";
+    var running = allTasks.filter(function (t) { return t.phase !== "queued" && t.phase !== "done" && t.phase !== "error"; }).length;
+    document.getElementById("taskSummary").textContent = (s.queue_depth || 0) + " queued · " + running + " active";
 
-    var order = { queued: 0, matching: 1, leasing: 2, dispatched: 3, running: 4, collecting: 5, pr_check: 6, distilling: 7, done: 8 };
-    var tasks = state.tasks.slice().sort(function (a, b) {
+    var order = { queued: 0, matching: 1, leasing: 2, dispatched: 3, running: 4, collecting: 5, pr_check: 6, distilling: 7, done: 8, error: 8 };
+    var tasks = allTasks.slice().sort(function (a, b) {
       var pa = order[a.phase] != null ? order[a.phase] : 9;
       var pb = order[b.phase] != null ? order[b.phase] : 9;
       if (pa !== pb) return pa - pb;
@@ -57,12 +65,14 @@
     document.getElementById("taskList").innerHTML = tasks.map(function (t) {
       var right;
       if (t.phase === "done") {
-        var badge = '<span class="phase oc-' + t.outcome + '">' + t.outcome.replace(/_/g, " ") + '</span>';
-        right = t.outcome === "pr_opened"
-          ? '<a class="prlink" href="' + esc(t.pr_url) + '" target="_blank" rel="noopener">PR ' + esc(t.pr_url.split("/").pop()) + ' &#8599;</a>' + badge
+        var oc = t.outcome || "done";
+        var badge = '<span class="phase oc-' + esc(oc) + '">' + esc(oc).replace(/_/g, " ") + '</span>';
+        var pr = t.pr_url || "";
+        right = (t.outcome === "pr_opened" && pr)
+          ? '<a class="prlink" href="' + esc(pr) + '" target="_blank" rel="noopener">PR ' + esc(pr.split("/").pop()) + ' &#8599;</a>' + badge
           : badge;
       } else {
-        right = '<span class="phase ph-' + t.phase + '">' + t.phase.replace(/_/g, " ") + '</span>';
+        right = '<span class="phase ph-' + esc(t.phase) + '">' + esc(t.phase).replace(/_/g, " ") + '</span>';
       }
       return '<div class="taskrow">' +
         '<span class="svc">' + esc(t.service) + '</span>' +
@@ -71,7 +81,7 @@
         '</div>';
     }).join("") || '<div class="taskrow"><span class="al">No tasks in flight.</span></div>';
 
-    document.getElementById("memList").innerHTML = '<div class="memlist">' + state.memory.map(function (m) {
+    document.getElementById("memList").innerHTML = '<div class="memlist">' + memory.map(function (m) {
       return '<button class="memrow" data-id="' + m.id + '">' +
         '<span class="mc">' + esc(m.signature) + '</span>' +
         '<span class="mr">' + esc(m.root_cause) + '</span>' +
