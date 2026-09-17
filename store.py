@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS runs(
 );
 """
 
-AVAILABLE = ("free", "dirty")
+AVAILABLE = ("ready", "dirty")
 
 
 class Store:
@@ -38,6 +38,7 @@ class Store:
             for col, decl in cols.items():
                 if col not in have:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.db.execute("UPDATE boxes SET state='ready' WHERE state='free'")
 
     def _tx(self):
         return _Tx(self)
@@ -94,15 +95,24 @@ class Store:
             if not run:
                 return None
             box = self.db.execute(
-                "SELECT * FROM boxes WHERE state IN ('free','dirty') ORDER BY CASE state WHEN 'free' THEN 0 ELSE 1 END, name LIMIT 1"
+                "SELECT * FROM boxes WHERE state IN ('ready','dirty') ORDER BY CASE state WHEN 'ready' THEN 0 ELSE 1 END, name LIMIT 1"
             ).fetchone()
             if not box:
                 return None
             now = time.time()
+            if box["state"] == "ready":
+                lease = uuid.uuid4().hex[:12]
+                self.db.execute(
+                    "UPDATE boxes SET state='leased', since=?, lease_id=?, run_id=?, acquired_at=?, expires_at=?, "
+                    "last_heartbeat=?, heartbeat_required=1 WHERE name=?",
+                    (now, lease, run["run_id"], now, now + run["ttl_s"], now, box["name"]))
+                self.db.execute("UPDATE runs SET state='running', box=?, started_at=? WHERE run_id=?",
+                                (box["name"], now, run["run_id"]))
+                return {"run_id": run["run_id"], "box": box["name"], "direct": True}
             self.db.execute("UPDATE boxes SET state='preparing', since=?, run_id=?, lease_id=NULL WHERE name=?",
                             (now, run["run_id"], box["name"]))
             self.db.execute("UPDATE runs SET state='preparing', box=? WHERE run_id=?", (box["name"], run["run_id"]))
-            return {"run_id": run["run_id"], "box": box["name"]}
+            return {"run_id": run["run_id"], "box": box["name"], "direct": False}
 
     def request_reset(self, name) -> dict:
         with self._tx():
@@ -119,7 +129,7 @@ class Store:
         now = time.time() if now is None else now
         with self._tx():
             if run_id is None:
-                self.db.execute("UPDATE boxes SET state='free', since=?, run_id=NULL, lease_id=NULL, fail_count=0 WHERE name=?",
+                self.db.execute("UPDATE boxes SET state='ready', since=?, run_id=NULL, lease_id=NULL, fail_count=0 WHERE name=?",
                                 (now, name))
                 return None
             lease = uuid.uuid4().hex[:12]
@@ -153,7 +163,7 @@ class Store:
                                 (now, r["box"], run_id))
 
     def pick_ready(self) -> Optional[str]:
-        r = self.db.execute("SELECT name FROM boxes WHERE state='free' ORDER BY name LIMIT 1").fetchone()
+        r = self.db.execute("SELECT name FROM boxes WHERE state='ready' ORDER BY name LIMIT 1").fetchone()
         return r["name"] if r else None
 
     def pick_dirty_idle(self) -> Optional[str]:
@@ -164,7 +174,7 @@ class Store:
         now = time.time() if now is None else now
         with self._tx():
             b = self.box(name)
-            if not b or b["state"] != "free":
+            if not b or b["state"] != "ready":
                 raise ValueError(f"box {name} is not ready")
             lease = uuid.uuid4().hex[:12]
             self.db.execute(

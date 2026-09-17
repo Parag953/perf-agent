@@ -58,7 +58,10 @@ class Poold:
                 continue
             try:
                 d = self.store.dispatch()
-                if d:
+                if d and d.get("direct"):
+                    log(f"{d['box']}: ready box handed to run {d['run_id']} without a rollback")
+                    threading.Thread(target=self._run_only, args=(d["box"], d["run_id"]), daemon=True).start()
+                elif d:
                     threading.Thread(target=self._prepare_and_run, args=(d["box"], d["run_id"]), daemon=True).start()
                 elif self.cfg.get("auto_prepare", False):
                     name = self.store.pick_dirty_idle()
@@ -140,11 +143,24 @@ class Poold:
             return
         run = self.store.run(run_id)
         self.store.mark_leased(box_name, run_id, ttl_s=run["ttl_s"])
+        self._execute(box_name, run_id, res.ip, user)
+
+    def _run_only(self, box_name: str, run_id: str):
+        try:
+            b = self.store.box(box_name)
+            self._execute(box_name, run_id, b["ip"], b["ssh_user"])
+        except Exception as e:
+            log(f"{box_name}: unexpected error in run: {traceback.format_exc()}")
+            if self.store.run(run_id)["state"] == "running":
+                self.store.end_run(run_id, exit_code=255, error=f"internal: {type(e).__name__}: {e}")
+
+    def _execute(self, box_name: str, run_id: str, ip: str, user: str):
+        run = self.store.run(run_id)
         log_path = os.path.join(self.trace_dir, f"{run_id}.log")
         with open(log_path, "a") as f:
-            f.write(f"# run {run_id} on {box_name} ({res.ip}) task: {run['task']}\n")
+            f.write(f"# run {run_id} on {box_name} ({ip}) task: {run['task']}\n")
         try:
-            rc = self.remote.run_task(user, res.ip, run["task"], log_path,
+            rc = self.remote.run_task(user, ip, run["task"], log_path,
                                       on_start=lambda p: self.procs.__setitem__(run_id, p))
         except Exception as e:
             rc = 255
@@ -199,7 +215,7 @@ class Poold:
         v["last_prepare"] = getattr(self, "last_prepare", {}).get(b["name"])
         return v
 
-    CONTRACT_STATE = {"leased": "allocated", "free": "ready", "quarantined": "degraded",
+    CONTRACT_STATE = {"leased": "allocated", "ready": "ready", "quarantined": "degraded",
                       "dirty": "free", "preparing": "free"}
 
     def vm_id(self, b: dict) -> str:

@@ -72,7 +72,7 @@ class Lifecycle(unittest.TestCase):
         s = mk()
         s.request_reset("andro-b")
         s.mark_leased("andro-b", None, ttl_s=0)
-        self.assertEqual(s.box("andro-b")["state"], "free")
+        self.assertEqual(s.box("andro-b")["state"], "ready")
 
     def test_run_exit_zero_is_done_and_box_dirty(self):
         s = mk()
@@ -163,7 +163,7 @@ class ExternalLease(unittest.TestCase):
     def test_lease_ready_box_returns_lease_and_marks_leased(self):
         s = mk()
         s.request_reset("andro-b"); s.mark_leased("andro-b", None, ttl_s=0)
-        self.assertEqual(s.box("andro-b")["state"], "free")
+        self.assertEqual(s.box("andro-b")["state"], "ready")
         lease = s.lease_external("andro-b", ttl_s=7200, now=1000.0)
         b = s.box("andro-b")
         self.assertEqual(b["state"], "leased")

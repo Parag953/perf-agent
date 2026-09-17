@@ -100,7 +100,7 @@ class Api(unittest.TestCase):
         b = st["boxes"][0]
         self.assertEqual(b["name"], "andro-b")
         self.assertEqual(b["vm"]["status"], "running")
-        self.assertIn(b["state"], ("dirty", "free", "preparing"))
+        self.assertIn(b["state"], ("dirty", "ready", "preparing"))
 
     def test_run_goes_queued_preparing_running_done_and_box_returns_dirty(self):
         code, r = http("POST", f"{self.base}/run", {"task": "hostname", "owner": "abhi", "source": "test"})
@@ -132,14 +132,14 @@ class Api(unittest.TestCase):
 
     def test_reset_on_release_brings_box_back_to_free(self):
         _, r = http("POST", f"{self.base}/run", {"task": "x", "owner": "o", "reset_on_release": True})
-        self.assertTrue(wait_for(lambda: self.box()["state"] == "free", 10))
+        self.assertTrue(wait_for(lambda: self.box()["state"] == "ready", 10))
         self.assertEqual(len(self.pve.rollbacks), 2)
 
     def test_manual_reset_endpoint(self):
-        self.assertTrue(wait_for(lambda: self.box()["state"] in ("dirty", "free")))
+        self.assertTrue(wait_for(lambda: self.box()["state"] in ("dirty", "ready")))
         code, _ = http("POST", f"{self.base}/boxes/andro-b/reset")
         self.assertEqual(code, 202)
-        self.assertTrue(wait_for(lambda: self.box()["state"] == "free", 10))
+        self.assertTrue(wait_for(lambda: self.box()["state"] == "ready", 10))
 
     def test_trace_endpoint_returns_task_output(self):
         _, r = http("POST", f"{self.base}/run", {"task": "hostname", "owner": "o"})
@@ -226,3 +226,36 @@ class OrchestratorContract(unittest.TestCase):
         self.assertEqual(v["poold_state"], "leased")
         http("POST", f"{self.base}/boxes/andro-b/quarantine")
         self.assertEqual(self.vm()["state"], "degraded")
+
+
+class ReadyBoxHandover(unittest.TestCase):
+    def setUp(self):
+        self.pve, self.remote = FakePVE(), FakeRemote()
+        self.tmp = __import__("tempfile").mkdtemp()
+        cfg = {
+            "listen": "127.0.0.1:0", "db": ":memory:", "trace_dir": self.tmp, "lan_prefix": "10.0.0.",
+            "auto_prepare": True,
+            "boxes": [{"name": "andro-b", "vmid": 102, "ssh_user": "andro-2", "snapshot": "warm-live"}],
+            "gate": {"passes": 2, "interval_s": 0, "settle_s": 0, "timeout_s": 30, "expect_deploys": 13, "expect_ctx": "andromeda"},
+            "lease": {"default_ttl_s": 600, "heartbeat_grace_s": 90, "external_ttl_s": 7200},
+            "dispatch_interval_s": 0.05, "sweep_interval_s": 0.05,
+        }
+        self.p = Poold(cfg, pve=self.pve, remote=self.remote, gate_cfg=GateConfig(**cfg["gate"]))
+        self.p.start()
+        self.base = f"http://127.0.0.1:{self.p.port}"
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_run_on_a_ready_box_is_handed_over_without_another_rollback(self):
+        self.assertTrue(wait_for(lambda: http("GET", f"{self.base}/boxes/andro-b")[1]["state"] == "ready", 10))
+        self.assertEqual(len(self.pve.rollbacks), 1)
+        _, r = http("POST", f"{self.base}/run", {"task": "hostname", "owner": "o"})
+        self.assertTrue(wait_for(lambda: http("GET", f"{self.base}/runs/{r['run_id']}")[1]["state"] == "done", 10))
+        self.assertEqual(len(self.pve.rollbacks), 1)
+        self.assertEqual(self.remote.tasks, ["hostname"])
+
+    def test_internal_state_name_matches_contract(self):
+        self.assertTrue(wait_for(lambda: http("GET", f"{self.base}/boxes/andro-b")[1]["state"] == "ready", 10))
+        v = http("GET", f"{self.base}/poold/status")[1]["vms"][0]
+        self.assertEqual((v["state"], v["poold_state"]), ("ready", "ready"))
