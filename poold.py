@@ -40,7 +40,20 @@ class Poold:
         self.server.daemon_threads = True
         self.port = self.server.server_address[1]
 
+    def refresh_addresses(self):
+        for b in self.store.boxes():
+            try:
+                ip = self.pve.guest_ipv4(b["vmid"], self.lan_prefix)
+                if ip:
+                    self.store.set_ip(b["name"], ip)
+                ts = self.pve.guest_ipv4(b["vmid"], self.ts_prefix)
+                if ts:
+                    self.store.set_ts_ip(b["name"], ts)
+            except Exception as e:
+                log(f"{b['name']}: address refresh failed: {e}")
+
     def start(self):
+        self.refresh_addresses()
         for fn in (self._dispatch_loop, self._sweep_loop, self.server.serve_forever):
             t = threading.Thread(target=fn, daemon=True)
             t.start()

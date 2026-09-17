@@ -288,3 +288,22 @@ class TailscaleTarget(unittest.TestCase):
         _, lease = http("POST", f"{self.base}/poold/lease")
         self.assertEqual(lease["tailscale_target"], "andro-2@100.73.230.48")
         self.assertEqual(lease["ssh_target"], "andro-2@10.0.0.38")
+
+
+class StartupAddressRefresh(unittest.TestCase):
+    def test_addresses_are_resolved_at_startup_without_a_prepare(self):
+        pve, remote = FakePVE(), FakeRemote()
+        cfg = {"listen": "127.0.0.1:0", "db": ":memory:", "trace_dir": __import__("tempfile").mkdtemp(),
+               "lan_prefix": "10.0.0.", "tailscale_prefix": "100.", "auto_prepare": False,
+               "boxes": [{"name": "andro-b", "vmid": 102, "ssh_user": "andro-2", "snapshot": "warm-live", "ip": "10.0.0.99"}],
+               "gate": {"passes": 2, "interval_s": 0, "settle_s": 0, "timeout_s": 30, "expect_deploys": 13, "expect_ctx": "andromeda"},
+               "dispatch_interval_s": 5, "sweep_interval_s": 5}
+        p = Poold(cfg, pve=pve, remote=remote, gate_cfg=GateConfig(**cfg["gate"]))
+        p.start()
+        try:
+            v = http("GET", f"http://127.0.0.1:{p.port}/poold/status")[1]["vms"][0]
+            self.assertEqual(v["host"], "10.0.0.38")
+            self.assertEqual(v["tailscale_host"], "100.73.230.48")
+            self.assertEqual(pve.rollbacks, [])
+        finally:
+            p.stop()
