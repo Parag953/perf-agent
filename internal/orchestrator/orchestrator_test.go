@@ -74,9 +74,43 @@ func (p *fakePoold) Status(context.Context) ([]model.VM, error) {
 	return []model.VM{{VMID: "VM101", State: st, Host: "10.0.0.1"}}, nil
 }
 
+// capPoold is a single-VM pool: a second concurrent lease gets ErrNoCapacity, so
+// it exercises the wait-queue/scheduler path (unlike fakePoold, which never fails).
+type capPoold struct {
+	mu   sync.Mutex
+	held bool
+}
+
+func (p *capPoold) Lease(context.Context) (*poold.Lease, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.held {
+		return nil, poold.ErrNoCapacity
+	}
+	p.held = true
+	return &poold.Lease{VMID: "VM101", SSHTarget: "agent@10.0.0.1", State: "allocated"}, nil
+}
+
+func (p *capPoold) Release(context.Context, string) error {
+	p.mu.Lock()
+	p.held = false
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *capPoold) Status(context.Context) ([]model.VM, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := model.VMReady
+	if p.held {
+		st = model.VMAllocated
+	}
+	return []model.VM{{VMID: "VM101", State: st}}, nil
+}
+
 func waitDone(t *testing.T, o *Orchestrator, taskID string) model.Task {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, task := range o.Snapshot().Tasks {
 			if task.ID == taskID && (task.Phase == model.PhaseDone || task.Phase == model.PhaseError) {
@@ -138,6 +172,37 @@ func TestPipeline_MissThenHit(t *testing.T) {
 	row, _ := mem.Get(done.MemoryID)
 	if row.HitCount != 1 {
 		t.Fatalf("hit_count = %d, want 1", row.HitCount)
+	}
+}
+
+// With one VM and two simultaneous misses, the second must queue (not error) and
+// both must complete once the VM frees — the wait-queue/scheduler contract.
+func TestQueueDrainsUnderCapacity(t *testing.T) {
+	dir := t.TempDir()
+	mem, err := store.Open(filepath.Join(dir, "memory.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mem.Close()
+
+	cfg := config.Config{Workers: 4, DispatchMode: "mock", ClaudeTimeout: 5 * time.Second}
+	o := New(cfg, &capPoold{}, mem, fakeLLM{}, dispatch.New(cfg), nil, log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o.Start(ctx)
+
+	// Two different services so both miss memory and both need the single VM.
+	a := o.Submit(model.Trigger{Service: "tachyon", Alert: "heap", Payload: json.RawMessage(`{}`)})
+	b := o.Submit(model.Trigger{Service: "kepler", Alert: "cpu", Payload: json.RawMessage(`{}`)})
+
+	da := waitDone(t, o, a.ID)
+	db := waitDone(t, o, b.ID)
+	if da.Outcome != model.OutcomePROpened || db.Outcome != model.OutcomePROpened {
+		t.Fatalf("both tasks should complete via the queue: a=%q b=%q", da.Outcome, db.Outcome)
+	}
+	// Both ran on the one VM, so two memory rows were written — no lost/errored task.
+	if got := len(mustSummaries(t, mem)); got != 2 {
+		t.Fatalf("memory rows = %d, want 2 (both tasks completed)", got)
 	}
 }
 

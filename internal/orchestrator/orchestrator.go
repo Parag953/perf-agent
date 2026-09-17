@@ -1,7 +1,16 @@
 // Package orchestrator is app.py's successor: it takes a trigger, fingerprints
-// the issue, checks memory, and on a miss leases a VM, dispatches the agent,
-// distills the result back into memory, and releases the VM. It also serves the
-// live state the dashboard reads.
+// the issue, checks memory, and on a miss queues the task for a VM, dispatches
+// the agent, distills the result back into memory, and releases the VM. It also
+// serves the live state the dashboard reads.
+//
+// Concurrency model:
+//   - Submit → intake channel.
+//   - matcher goroutines: signature + memory match. Hit → done (no VM). Miss →
+//     append to the wait-queue (visible as phase "waiting").
+//   - one scheduler goroutine: whenever a VM might be free (a release, a poold
+//     poll tick, or a new task queued) it leases VMs and dispatches queued tasks
+//     in FIFO order. If poold reports no capacity the task stays queued.
+//   - each dispatch runs in its own goroutine; the leased VM gates concurrency.
 package orchestrator
 
 import (
@@ -35,16 +44,21 @@ type Orchestrator struct {
 	hub  Broadcaster
 	log  *log.Logger
 
-	queue chan *model.Task
+	intake chan *model.Task
+	wake   chan struct{} // nudges the scheduler (release / poll / new queued task)
 
 	mu       sync.Mutex
 	tasks    map[string]*model.Task
 	order    []string // task ids, insertion order
+	logs     map[string][]model.AgentEvent
 	seq      int64
 	total    int // cumulative tasks submitted (survives eviction)
 	hits     int
 	durSum   time.Duration
 	durCount int
+
+	waitMu    sync.Mutex
+	waitQueue []*model.Task // FIFO of tasks that missed memory and await a VM
 
 	vmMu   sync.Mutex
 	vmSnap []model.VM // last good poold status
@@ -52,23 +66,26 @@ type Orchestrator struct {
 
 func New(cfg config.Config, pool poold.Client, mem *store.Store, l llm.Client, disp dispatch.Dispatcher, hub Broadcaster, logger *log.Logger) *Orchestrator {
 	return &Orchestrator{
-		cfg:   cfg,
-		pool:  pool,
-		mem:   mem,
-		llm:   l,
-		disp:  disp,
-		hub:   hub,
-		log:   logger,
-		queue: make(chan *model.Task, 256),
-		tasks: make(map[string]*model.Task),
+		cfg:    cfg,
+		pool:   pool,
+		mem:    mem,
+		llm:    l,
+		disp:   disp,
+		hub:    hub,
+		log:    logger,
+		intake: make(chan *model.Task, 256),
+		wake:   make(chan struct{}, 1),
+		tasks:  make(map[string]*model.Task),
+		logs:   make(map[string][]model.AgentEvent),
 	}
 }
 
-// Start launches the worker pool and a background poller for poold status.
+// Start launches the matcher pool, the scheduler, and the poold poller.
 func (o *Orchestrator) Start(ctx context.Context) {
-	for i := 0; i < o.cfg.Workers; i++ {
-		go o.worker(ctx, i)
+	for range max(o.cfg.Workers, 1) {
+		go o.matcher(ctx)
 	}
+	go o.scheduler(ctx)
 	go o.pollStatus(ctx)
 }
 
@@ -93,30 +110,32 @@ func (o *Orchestrator) Submit(t model.Trigger) model.Task {
 
 	o.broadcast()
 	select {
-	case o.queue <- task:
+	case o.intake <- task:
 	default:
-		o.log.Printf("queue full, dropping task %s", id)
+		o.log.Printf("intake full, dropping task %s", id)
+		o.fail(task, fmt.Errorf("intake queue full"))
 	}
 	return snap
 }
 
-func (o *Orchestrator) worker(ctx context.Context, n int) {
+// ---- matcher: fingerprint + memory lookup ----
+
+func (o *Orchestrator) matcher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case task := <-o.queue:
-			o.handle(ctx, task)
+		case task := <-o.intake:
+			o.match(ctx, task)
 		}
 	}
 }
 
-func (o *Orchestrator) handle(ctx context.Context, task *model.Task) {
+func (o *Orchestrator) match(ctx context.Context, task *model.Task) {
 	trigger := model.Trigger{Service: task.Service, Alert: task.Alert, Payload: task.Payload}
 	now := time.Now().UTC()
 	o.update(task, func(t *model.Task) { t.StartedAt = &now })
 
-	// 1. Fingerprint + memory lookup.
 	o.setPhase(task, model.PhaseMatching)
 	sig, err := llm.Signature(ctx, o.llm, trigger)
 	if err != nil {
@@ -142,6 +161,7 @@ func (o *Orchestrator) handle(ctx context.Context, task *model.Task) {
 			o.mu.Lock()
 			o.hits++
 			o.mu.Unlock()
+			o.appendLog(task.ID, model.AgentEvent{Kind: "result", Summary: "memory hit — reused a prior analysis, no VM spent"})
 			o.finish(task, model.OutcomeMemoryHit, func(t *model.Task) {
 				t.MemoryID = matchID
 				t.PRURL = mem.PRURL
@@ -151,35 +171,107 @@ func (o *Orchestrator) handle(ctx context.Context, task *model.Task) {
 		}
 	}
 
-	// 2. Lease a VM (retry while the pool is exhausted).
-	o.setPhase(task, model.PhaseLeasing)
-	lease, err := o.leaseWithWait(ctx, task)
-	if err != nil {
-		o.fail(task, fmt.Errorf("lease: %w", err))
-		return
+	// Miss: join the wait-queue for a VM.
+	o.enqueueWaiting(task)
+}
+
+// ---- wait-queue ----
+
+func (o *Orchestrator) enqueueWaiting(task *model.Task) {
+	o.setPhase(task, model.PhaseWaiting)
+	o.waitMu.Lock()
+	o.waitQueue = append(o.waitQueue, task)
+	o.waitMu.Unlock()
+	o.signalWake()
+}
+
+func (o *Orchestrator) dequeueWaiting() *model.Task {
+	o.waitMu.Lock()
+	defer o.waitMu.Unlock()
+	if len(o.waitQueue) == 0 {
+		return nil
 	}
-	o.update(task, func(t *model.Task) { t.VMID = lease.VMID })
+	t := o.waitQueue[0]
+	o.waitQueue = o.waitQueue[1:]
+	return t
+}
+
+func (o *Orchestrator) requeueFront(task *model.Task) {
+	o.waitMu.Lock()
+	o.waitQueue = append([]*model.Task{task}, o.waitQueue...)
+	o.waitMu.Unlock()
+}
+
+func (o *Orchestrator) queueDepth() int {
+	o.waitMu.Lock()
+	defer o.waitMu.Unlock()
+	return len(o.waitQueue)
+}
+
+func (o *Orchestrator) signalWake() {
+	select {
+	case o.wake <- struct{}{}:
+	default:
+	}
+}
+
+// ---- scheduler: lease VMs for queued tasks, FIFO ----
+
+func (o *Orchestrator) scheduler(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-o.wake:
+		}
+		for {
+			task := o.dequeueWaiting()
+			if task == nil {
+				break
+			}
+			o.setPhase(task, model.PhaseLeasing)
+			lease, err := o.pool.Lease(ctx)
+			if errors.Is(err, poold.ErrNoCapacity) {
+				// No VM free — put it back at the front and wait for the next wake.
+				o.requeueFront(task)
+				o.setPhase(task, model.PhaseWaiting)
+				break
+			}
+			if err != nil {
+				o.fail(task, fmt.Errorf("lease: %w", err))
+				continue
+			}
+			o.update(task, func(t *model.Task) { t.VMID = lease.VMID })
+			go o.investigate(ctx, task, lease)
+			o.refreshStatus(ctx) // reflect the fresh allocation in the VM grid promptly
+
+		}
+	}
+}
+
+// investigate runs one task on its leased VM and always releases it.
+func (o *Orchestrator) investigate(ctx context.Context, task *model.Task, lease *poold.Lease) {
 	defer o.release(lease.VMID)
 
-	// 3. Dispatch the agent.
+	trigger := model.Trigger{Service: task.Service, Alert: task.Alert, Payload: task.Payload}
+
 	o.setPhase(task, model.PhaseDispatched)
-	prior := o.closestMemory(task.Service, sig)
+	prior := o.closestMemory(task.Service, task.Signature)
 	prompt := dispatch.BuildInvestigationPrompt(o.cfg, trigger, prior)
 	o.setPhase(task, model.PhaseRunning)
 
+	emit := func(ev model.AgentEvent) { o.appendLog(task.ID, ev) }
 	runCtx, cancel := context.WithTimeout(ctx, o.cfg.ClaudeTimeout)
-	analysis, err := o.disp.Run(runCtx, lease.SSHTarget, prompt)
+	analysis, err := o.disp.Run(runCtx, lease.SSHTarget, prompt, emit)
 	cancel()
 	if err != nil {
+		o.appendLog(task.ID, model.AgentEvent{Kind: "error", Summary: truncate(err.Error(), 300)})
 		o.fail(task, fmt.Errorf("dispatch: %w", err))
 		return
 	}
 
-	// 4. Collect + PR check.
 	o.setPhase(task, model.PhaseCollecting)
 	if q := dispatch.ExtractNeedQueries(analysis); q != "" {
-		// The agent paused for DB data. The human-in-the-loop resume is future
-		// work; for now the task ends here without a memory write.
 		o.finish(task, model.OutcomeNeedQueries, nil)
 		o.log.Printf("task %s: agent needs DB queries — parked (resume is future work)", task.ID)
 		return
@@ -187,9 +279,8 @@ func (o *Orchestrator) handle(ctx context.Context, task *model.Task) {
 	o.setPhase(task, model.PhasePRCheck)
 	prURL := dispatch.ExtractPRURL(analysis)
 
-	// 5. Distill into memory.
 	o.setPhase(task, model.PhaseDistilling)
-	mem, err := llm.Distill(ctx, o.llm, trigger, sig, analysis, prURL)
+	mem, err := llm.Distill(ctx, o.llm, trigger, task.Signature, analysis, prURL)
 	if err != nil {
 		o.log.Printf("task %s: distill failed: %v", task.ID, err)
 	}
@@ -209,29 +300,6 @@ func (o *Orchestrator) handle(ctx context.Context, task *model.Task) {
 	o.log.Printf("task %s: done (outcome=%s, pr=%q, mem=%d)", task.ID, outcome, prURL, memID)
 }
 
-// leaseWithWait retries Lease while poold reports no capacity, backing off and
-// keeping the task visible as "leasing" the whole time.
-func (o *Orchestrator) leaseWithWait(ctx context.Context, task *model.Task) (*poold.Lease, error) {
-	backoff := 2 * time.Second
-	for {
-		lease, err := o.pool.Lease(ctx)
-		if err == nil {
-			return lease, nil
-		}
-		if !errors.Is(err, poold.ErrNoCapacity) {
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(backoff):
-		}
-		if backoff < 15*time.Second {
-			backoff += 2 * time.Second
-		}
-	}
-}
-
 func (o *Orchestrator) release(vmID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -239,6 +307,7 @@ func (o *Orchestrator) release(vmID string) {
 		o.log.Printf("release %s failed: %v", vmID, err)
 	}
 	o.refreshStatus(ctx)
+	o.signalWake() // a VM just freed — let the scheduler pull the next queued task
 }
 
 // closestMemory returns a compact hint from the most-recently-seen memory for
@@ -257,6 +326,36 @@ func (o *Orchestrator) closestMemory(service, _ string) string {
 		hint += "\nprior_pr=" + m.PRURL
 	}
 	return hint
+}
+
+// ---- per-task activity log ----
+
+const maxLogEvents = 400
+
+func (o *Orchestrator) appendLog(id string, ev model.AgentEvent) {
+	o.mu.Lock()
+	if ev.TS.IsZero() {
+		ev.TS = time.Now().UTC()
+	}
+	l := o.logs[id]
+	ev.Seq = len(l)
+	l = append(l, ev)
+	if len(l) > maxLogEvents {
+		l = l[len(l)-maxLogEvents:]
+	}
+	o.logs[id] = l
+	o.mu.Unlock()
+	o.broadcast()
+}
+
+// TaskLog backs GET /api/logs/:id.
+func (o *Orchestrator) TaskLog(id string) []model.AgentEvent {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	src := o.logs[id]
+	out := make([]model.AgentEvent, len(src))
+	copy(out, src)
+	return out
 }
 
 // ---- task state helpers (all broadcast) ----
@@ -327,6 +426,7 @@ func (o *Orchestrator) evictLocked() {
 	for _, id := range o.order {
 		if remove > 0 && isTerminal(o.tasks[id].Phase) {
 			delete(o.tasks, id)
+			delete(o.logs, id)
 			remove--
 			continue
 		}
@@ -351,6 +451,7 @@ func (o *Orchestrator) pollStatus(ctx context.Context) {
 			return
 		case <-t.C:
 			o.refreshStatus(ctx)
+			o.signalWake() // capacity may have freed up out-of-band
 		}
 	}
 }
@@ -378,16 +479,18 @@ func (o *Orchestrator) Snapshot() model.State {
 
 	o.mu.Lock()
 	tasks := make([]model.Task, 0, len(o.order))
-	queueDepth := 0
+	// Map each VM to the task currently holding it, so the UI can show what an
+	// allocated VM is running (poold's own task_id can be null).
+	vmTask := map[string]string{}
 	for _, id := range o.order {
 		t := o.tasks[id]
 		tasks = append(tasks, t.Clone())
-		if t.Phase == model.PhaseQueued {
-			queueDepth++
+		if t.VMID != "" && !isTerminal(t.Phase) {
+			vmTask[t.VMID] = t.ID
 		}
 	}
 	stats := model.Stats{
-		QueueDepth: queueDepth,
+		QueueDepth: o.queueDepth(),
 		TasksTotal: o.total,
 		CacheHits:  o.hits,
 	}
@@ -399,9 +502,12 @@ func (o *Orchestrator) Snapshot() model.State {
 	}
 	o.mu.Unlock()
 
-	for _, vm := range vms {
+	for i := range vms {
+		if id, ok := vmTask[vms[i].VMID]; ok && vms[i].TaskID == "" {
+			vms[i].TaskID = id
+		}
 		stats.VMsTotal++
-		switch vm.State {
+		switch vms[i].State {
 		case model.VMReady, model.VMFree:
 			stats.VMsReady++
 		case model.VMAllocated:
@@ -440,4 +546,11 @@ func (o *Orchestrator) broadcast() {
 
 func round2(f float64) float64 {
 	return float64(int(f*100+0.5)) / 100
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }

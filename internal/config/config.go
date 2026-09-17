@@ -36,6 +36,7 @@ type Config struct {
 	// inject the secrets the agent needs. Idempotent, so a pre-baked image no-ops.
 	VMBootstrap bool   // run the bootstrap step before dispatch (default true)
 	GHVersion   string // gh CLI version for the tarball fallback install
+	AgentStream bool   // stream `claude -p` step-by-step (stream-json) for the live UI
 
 	// Secrets forwarded into the VM's investigation run (never logged, written to
 	// a 0600 env file on the VM). All optional — set the ones the agent needs.
@@ -77,6 +78,7 @@ func Load() Config {
 
 		VMBootstrap:        envBool("VM_BOOTSTRAP", true),
 		GHVersion:          env("GH_VERSION", "2.63.2"),
+		AgentStream:        envBool("AGENT_STREAM", true),
 		ClaudeOAuthToken:   env("CLAUDE_CODE_OAUTH_TOKEN", ""),
 		GHToken:            env("GH_TOKEN", env("GITHUB_TOKEN", "")),
 		DDApiKey:           env("DD_API_KEY", ""),

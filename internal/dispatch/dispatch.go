@@ -4,6 +4,7 @@
 package dispatch
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,16 +13,27 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Parag953/perf-agent/internal/config"
 	"github.com/Parag953/perf-agent/internal/model"
 )
 
-// Dispatcher runs the investigation prompt against a VM and returns the agent's
-// analysis text (its stdout `result`).
+// Emit receives each agent step as it happens, for the live dashboard view. It
+// may be nil (no streaming consumer).
+type Emit func(model.AgentEvent)
+
+// Dispatcher runs the investigation prompt against a VM, streaming each step to
+// emit, and returns the agent's final analysis text (its `result`).
 type Dispatcher interface {
-	Run(ctx context.Context, sshTarget, prompt string) (string, error)
+	Run(ctx context.Context, sshTarget, prompt string, emit Emit) (string, error)
 	Mode() string
+}
+
+func fire(emit Emit, kind, tool, summary string) {
+	if emit != nil {
+		emit(model.AgentEvent{TS: time.Now().UTC(), Kind: kind, Tool: tool, Summary: summary})
+	}
 }
 
 // New selects a dispatcher from config: "ssh" or "mock".
@@ -45,6 +57,7 @@ func New(cfg config.Config) Dispatcher {
 		allowedTools: cfg.AllowedTools,
 		bootstrap:    cfg.VMBootstrap,
 		ghVersion:    cfg.GHVersion,
+		stream:       cfg.AgentStream,
 		secretEnv:    secretEnv(cfg),
 	}
 }
@@ -68,12 +81,13 @@ type sshDispatcher struct {
 
 	bootstrap bool              // provision the VM before the run
 	ghVersion string            // gh version for the tarball fallback
+	stream    bool              // stream-json (live steps) vs buffered json
 	secretEnv map[string]string // forwarded into the run; never logged
 }
 
 func (d sshDispatcher) Mode() string { return "ssh" }
 
-func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (string, error) {
+func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string, emit Emit) (string, error) {
 	if sshTarget == "" {
 		return "", fmt.Errorf("ssh dispatch: empty ssh target")
 	}
@@ -81,9 +95,11 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 	// 1. Provision the (blank) VM: install claude/gh if missing and drop the
 	//    secrets file. Idempotent — a pre-baked image makes this a fast no-op.
 	if d.bootstrap {
+		fire(emit, "provision", "", "provisioning VM (claude/gh/aws + secrets)…")
 		if err := d.doBootstrap(ctx, sshTarget); err != nil {
 			return "", err
 		}
+		fire(emit, "provision", "", "VM provisioned")
 	}
 
 	// 2. Investigation run. Source the secrets file (so CLAUDE_CODE_OAUTH_TOKEN,
@@ -91,25 +107,78 @@ func (d sshDispatcher) Run(ctx context.Context, sshTarget, prompt string) (strin
 	//    ${DD_API_KEY} refs in mcp.json from there), put ~/.local/bin on PATH so
 	//    freshly-installed claude/gh/aws resolve, then run. claude reads the
 	//    (large) prompt from stdin, so we pipe it over ssh stdin, not argv.
+	format := "json"
+	if d.stream {
+		format = "stream-json --verbose"
+	}
 	mcpArg := shellQuote(d.mcpConfig)
 	if d.mcpContent != "" {
 		mcpArg = remoteMCPPath // bootstrap wrote it here; already double-quoted
 	}
 	remote := fmt.Sprintf(
-		`set -a; [ -f %s ] && . %s; set +a; export PATH="$HOME/.local/bin:$PATH"; %s -p --output-format json --mcp-config %s --allowedTools %s`,
-		remoteCredsPath, remoteCredsPath, d.claudeBin, mcpArg, shellQuote(d.allowedTools))
+		`set -a; [ -f %s ] && . %s; set +a; export PATH="$HOME/.local/bin:$PATH"; %s -p --output-format %s --mcp-config %s --allowedTools %s`,
+		remoteCredsPath, remoteCredsPath, d.claudeBin, format, mcpArg, shellQuote(d.allowedTools))
 
-	stdout, stderr, err := d.runSSH(ctx, sshTarget, remote, prompt)
-	if err != nil {
-		return "", fmt.Errorf("ssh dispatch: %v: %s", err, strings.TrimSpace(stderr))
+	if !d.stream {
+		stdout, stderr, err := d.runSSH(ctx, sshTarget, remote, prompt)
+		if err != nil {
+			return "", fmt.Errorf("ssh dispatch: %v: %s", err, strings.TrimSpace(stderr))
+		}
+		return parseClaudeJSON([]byte(stdout)), nil
 	}
-	return parseClaudeJSON([]byte(stdout)), nil
+	return d.runSSHStream(ctx, sshTarget, remote, prompt, emit)
 }
 
 // runSSH executes one remote command over ssh, piping stdin to it, and returns
 // its stdout/stderr. stdin carries either the bootstrap script or the prompt —
 // never a secret in argv (secrets travel in the bootstrap script's stdin).
 func (d sshDispatcher) runSSH(ctx context.Context, sshTarget, remote, stdin string) (string, string, error) {
+	cmd := d.sshCmd(ctx, sshTarget, remote, stdin)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+// runSSHStream runs claude with --output-format stream-json, parsing each NDJSON
+// line into an AgentEvent as it arrives (emit) and returning the final result.
+func (d sshDispatcher) runSSHStream(ctx context.Context, sshTarget, remote, stdin string, emit Emit) (string, error) {
+	cmd := d.sshCmd(ctx, sshTarget, remote, stdin)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	var result string
+	sc := bufio.NewScanner(stdoutPipe)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // tool_result lines can be large
+	for sc.Scan() {
+		evs, res, gotResult := streamEvents(sc.Bytes())
+		for _, ev := range evs {
+			if emit != nil {
+				ev.TS = time.Now().UTC()
+				emit(ev)
+			}
+		}
+		if gotResult {
+			result = res
+		}
+	}
+	if err := sc.Err(); err != nil {
+		fire(emit, "error", "", "stream read error: "+truncate(err.Error(), 200))
+	}
+	if err := cmd.Wait(); err != nil {
+		return "", fmt.Errorf("ssh dispatch: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return result, nil
+}
+
+func (d sshDispatcher) sshCmd(ctx context.Context, sshTarget, remote, stdin string) *exec.Cmd {
 	args := []string{}
 	if d.key != "" {
 		args = append(args, "-i", d.key)
@@ -121,10 +190,7 @@ func (d sshDispatcher) runSSH(ctx context.Context, sshTarget, remote, stdin stri
 	)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = strings.NewReader(stdin)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
+	return cmd
 }
 
 // doBootstrap ships the provisioning script to the VM over ssh stdin (so the
@@ -259,13 +325,157 @@ type mockDispatcher struct{}
 
 func (mockDispatcher) Mode() string { return "mock" }
 
-func (mockDispatcher) Run(_ context.Context, _, prompt string) (string, error) {
-	// Return a plausible, self-consistent analysis so the full pipeline
-	// (collect → pr_check → distill → memory) can be exercised without a VM.
+func (mockDispatcher) Run(ctx context.Context, _, prompt string, emit Emit) (string, error) {
+	// Emit a scripted, self-consistent investigation so the live UI and the full
+	// pipeline (collect → pr_check → distill → memory) can be exercised with no VM.
+	steps := []model.AgentEvent{
+		{Kind: "system", Summary: "session started (claude-sonnet, tools: Bash, Read, Edit, gh)"},
+		{Kind: "text", Summary: "Reproducing: heap grows under sustained query load. Checking the hot path."},
+		{Kind: "tool", Tool: "Bash", Summary: "rg -n 'ResourcesQuery' services/tachyon"},
+		{Kind: "tool_result", Summary: "resolve.go:214  q := NewResourcesQuery(scope)  // rebuilt per request"},
+		{Kind: "tool", Tool: "Read", Summary: "services/tachyon/resolve.go"},
+		{Kind: "text", Summary: "Found it: the scope map is rebuilt on every request instead of memoized."},
+		{Kind: "tool", Tool: "Bash", Summary: "aws s3 cp s3://as-live-heap-dump/tachyon/latest/heap.dump /tmp/ && go tool pprof -top"},
+		{Kind: "tool_result", Summary: "flat  cum   ResourcesQuery.build  41.2%  inuse_space — dominates retained heap"},
+		{Kind: "tool", Tool: "Edit", Summary: "services/tachyon/resolve.go — memoize per request context"},
+		{Kind: "tool", Tool: "Bash", Summary: "git checkout -b agent/tachyon-memoize-scope && gh pr create --draft"},
+		{Kind: "tool_result", Summary: "https://github.com/andromedasec/voyager/pull/9999"},
+		{Kind: "result", Summary: "Root cause confirmed; draft PR opened."},
+	}
+	for _, ev := range steps {
+		fire(emit, ev.Kind, ev.Tool, ev.Summary)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
 	return "Root cause: the resources cache is rebuilt on every request instead of " +
 		"being reused across the request lifetime, so heap allocations churn under load. " +
 		"Fix: memoize the query result for the duration of the request.\n" +
 		"PR_URL: https://github.com/andromedasec/voyager/pull/9999", nil
+}
+
+// ---- stream-json parsing ----
+
+// streamEvents maps one line of `claude -p --output-format stream-json` into zero
+// or more AgentEvents, and pulls out the final result text when present.
+func streamEvents(line []byte) (evs []model.AgentEvent, result string, gotResult bool) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || line[0] != '{' {
+		return nil, "", false
+	}
+	var m struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+		Result  string `json:"result"`
+		Model   string `json:"model"`
+		Message struct {
+			Content []struct {
+				Type    string          `json:"type"`
+				Text    string          `json:"text"`
+				Name    string          `json:"name"`
+				Input   json.RawMessage `json:"input"`
+				Content json.RawMessage `json:"content"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &m) != nil {
+		return nil, "", false
+	}
+
+	switch m.Type {
+	case "system":
+		if m.Subtype == "init" {
+			s := "session started"
+			if m.Model != "" {
+				s += " (" + m.Model + ")"
+			}
+			evs = append(evs, model.AgentEvent{Kind: "system", Summary: s})
+		}
+	case "assistant":
+		for _, c := range m.Message.Content {
+			switch c.Type {
+			case "text":
+				if t := strings.TrimSpace(c.Text); t != "" {
+					evs = append(evs, model.AgentEvent{Kind: "text", Summary: truncate(t, 600)})
+				}
+			case "tool_use":
+				evs = append(evs, model.AgentEvent{Kind: "tool", Tool: c.Name, Summary: toolSummary(c.Input)})
+			}
+		}
+	case "user":
+		for _, c := range m.Message.Content {
+			if c.Type == "tool_result" {
+				if s := resultSummary(c.Content); s != "" {
+					evs = append(evs, model.AgentEvent{Kind: "tool_result", Summary: s})
+				}
+			}
+		}
+	case "result":
+		result, gotResult = m.Result, true
+		s := "run complete"
+		if m.Subtype != "" && m.Subtype != "success" {
+			s = "run ended: " + m.Subtype
+		}
+		evs = append(evs, model.AgentEvent{Kind: "result", Summary: s})
+	}
+	return evs, result, gotResult
+}
+
+// toolSummary turns a tool_use input into a compact one-liner, favouring the
+// field that says what the agent actually did.
+func toolSummary(input json.RawMessage) string {
+	var m map[string]any
+	_ = json.Unmarshal(input, &m)
+	pick := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := m[k].(string); ok && v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	if s := pick("command", "file_path", "path", "pattern", "query", "url"); s != "" {
+		return oneLine(truncate(s, 300))
+	}
+	return oneLine(truncate(string(input), 200))
+}
+
+// resultSummary flattens a tool_result content (string or content blocks) into a
+// single truncated line.
+func resultSummary(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return oneLine(truncate(s, 300))
+	}
+	var blocks []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		var b strings.Builder
+		for _, bl := range blocks {
+			b.WriteString(bl.Text)
+			b.WriteString(" ")
+		}
+		return oneLine(truncate(b.String(), 300))
+	}
+	return oneLine(truncate(string(raw), 200))
+}
+
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(s, "\n", " ")), " ")
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // ---- Output parsing ----

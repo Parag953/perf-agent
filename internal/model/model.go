@@ -14,6 +14,7 @@ type Phase string
 const (
 	PhaseQueued     Phase = "queued"
 	PhaseMatching   Phase = "matching"
+	PhaseWaiting    Phase = "waiting" // in the VM wait-queue: memory missed, no free VM yet
 	PhaseLeasing    Phase = "leasing"
 	PhaseDispatched Phase = "dispatched"
 	PhaseRunning    Phase = "running"
@@ -75,6 +76,16 @@ func (t *Task) Clone() Task {
 	c := *t
 	c.Payload = nil
 	return c
+}
+
+// AgentEvent is one step of what the agent is doing on the VM, streamed from
+// `claude -p --output-format stream-json` and surfaced live in the dashboard.
+type AgentEvent struct {
+	Seq     int       `json:"seq"`
+	TS      time.Time `json:"ts"`
+	Kind    string    `json:"kind"`           // provision | system | text | tool | tool_result | result | error
+	Tool    string    `json:"tool,omitempty"` // tool name for kind=tool
+	Summary string    `json:"summary"`        // one human-readable line
 }
 
 // VM is a pool VM as reported by poold.Status.

@@ -19,8 +19,20 @@ trigger ─▶ [haiku] signature ─▶ memory lookup ─┬─ hit  ─▶ retu
                                                           memory.insert ─▶ poold.release()
 ```
 
-One task per VM, no retry. A VM is `ready`/`free` → `allocated` (on lease) →
-`degraded` (after its one task) → Poold recycles it → `ready`.
+One task per VM. A VM is `ready`/`free` → `allocated` (on lease) → `degraded`
+(after its one task) → Poold recycles it → `ready`.
+
+**Wait-queue + scheduler.** Matcher goroutines do the signature + memory match; a
+hit finishes with no VM. A miss joins a FIFO **wait-queue** (phase `waiting`,
+visible in the dashboard). A single scheduler leases VMs for queued tasks in order
+whenever capacity frees (a release, the 5s poold poll, or a new task) — so when all
+VMs are busy, extra triggers **queue** instead of erroring, and drain automatically
+as VMs come back.
+
+**Live activity.** Dispatch runs `claude -p --output-format stream-json`, so each
+step (tool call, command, result, the agent's reasoning) is captured as it happens
+and served per task at `GET /api/logs/:id`. In the dashboard, clicking a running
+task — or an allocated VM — opens a live view of what the agent is doing.
 
 ## Layout
 

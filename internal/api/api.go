@@ -19,6 +19,7 @@ type Engine interface {
 	Submit(model.Trigger) model.Task
 	Snapshot() model.State
 	GetMemory(id int64) (model.Memory, error)
+	TaskLog(id string) []model.AgentEvent
 }
 
 //go:embed dashboard.html
@@ -40,6 +41,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/stream", s.handleStream)
 	mux.HandleFunc("/api/memory/", s.handleMemory)
+	mux.HandleFunc("/api/logs/", s.handleLog)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("/", s.handleRoot)
 	return mux
@@ -135,6 +137,16 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, mem)
+}
+
+// handleLog serves the live agent activity for one task: GET /api/logs/:id.
+func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/logs/")
+	if id == "" {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.eng.TaskLog(id))
 }
 
 // ---- trigger parsing ----
